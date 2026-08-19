@@ -1,0 +1,25 @@
+# Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated application and installer artifacts
+build/
+dist/
+release/
+
+# Generated reports and temporary files
+output/
+tmp/
+*.pdf
+
+# Local test campaigns and XML evidence
+ST-I_Results/
+ST-I_Test_Scope/
+ST-I_ Results/
+
+# Local screenshots and operating-system files
+dpi_before.png
+Thumbs.db
+.DS_Store
