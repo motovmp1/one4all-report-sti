@@ -1,5 +1,5 @@
 #define MyAppName "Tridonic One4All Viewer"
-#define MyAppVersion "1.0"
+#define MyAppVersion "1.2"
 #define MyAppPublisher "PT Team"
 #define MyAppExeName "One4AllViewer.exe"
 
@@ -15,7 +15,7 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\release
-OutputBaseFilename=Tridonic-One4All-Viewer-Setup-1.0
+OutputBaseFilename=Tridonic-One4All-Viewer-Setup-1.2
 SetupIconFile=..\assets\app_icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/ultra64

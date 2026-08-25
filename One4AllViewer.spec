@@ -32,7 +32,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    version='packaging\\version_info.txt',
+    version='C:\\Users\\vinicius.pinho\\Documents\\one4all_report_sti_2gen\\packaging\\version_info.txt',
     icon=['assets\\app_icon.ico'],
 )
 coll = COLLECT(

@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import html
 import re
+import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ PALE_BLUE = HexColor("#EDF4FF")
 PALE_GREEN = HexColor("#EDF8F3")
 PALE_RED = HexColor("#FCEFF1")
 PALE_AMBER = HexColor("#FFF6E7")
+QA_DATA_FILE_NAME = "One4All_QA_data.xml"
 
 
 @dataclass
@@ -185,6 +187,30 @@ def load_campaign_info(scope_path: Path) -> dict[str, str]:
     return {key: value.strip() for key, value in attributes.items() if value.strip()}
 
 
+def load_qa_member_names(scope_path: Path, scoped: dict[str, Result]) -> list[str]:
+    """Return QA members assigned to the latest scoped results."""
+    qa_path = scope_path.parent / QA_DATA_FILE_NAME
+    if not qa_path.is_file():
+        return []
+    try:
+        root = ET.parse(qa_path).getroot()
+    except (OSError, ET.ParseError):
+        return []
+    members = {
+        (element.get("id") or "").strip().casefold(): (element.get("name") or "").strip()
+        for element in root.findall("./QAMembers/Member")
+        if (element.get("id") or "").strip() and (element.get("name") or "").strip()
+    }
+    current_results = {result.path.name.casefold() for result in scoped.values()}
+    assigned_ids = {
+        (element.get("qaMemberId") or "").strip().casefold()
+        for element in root.findall("./Tests/Test")
+        if (element.get("result") or "").strip().casefold() in current_results
+        and (element.get("qaMemberId") or "").strip()
+    }
+    return sorted({members[member_id] for member_id in assigned_ids if member_id in members}, key=str.casefold)
+
+
 def filename_slug(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", value.casefold()).strip("_")
     return slug or "test_campaign"
@@ -214,7 +240,31 @@ def collect(results_dir: Path, scope_ids: set[str]):
 
 
 def safe_text(value: str) -> str:
-    return value.encode("latin-1", "replace").decode("latin-1")
+    """Turn XML/user text into clean WinAnsi text for ReportLab's Helvetica.
+
+    In particular, line breaks and other control characters must not reach
+    ``drawString``: ReportLab renders some of them as visible square glyphs.
+    """
+    replacements = {
+        "\u00a0": " ", "\u00b7": " | ", "\u2022": " - ",
+        "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-",
+        "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2026": "...",
+    }
+    cleaned: list[str] = []
+    for character in str(value or ""):
+        if character in replacements:
+            cleaned.append(replacements[character])
+            continue
+        if character.isspace() or unicodedata.category(character).startswith("C"):
+            cleaned.append(" ")
+            continue
+        try:
+            character.encode("cp1252")
+            cleaned.append(character)
+        except UnicodeEncodeError:
+            fallback = unicodedata.normalize("NFKD", character).encode("ascii", "ignore").decode("ascii")
+            cleaned.append(fallback)
+    return re.sub(r"\s+", " ", "".join(cleaned)).strip()
 
 
 def text(c: canvas.Canvas, value: str, x: float, y: float, size=12, color=INK,
@@ -326,6 +376,20 @@ def joined(values: list[str], fallback: str = "Not recorded") -> str:
     return ", ".join(values) if values else fallback
 
 
+def compact_joined(values: list[str], fallback: str = "Not assigned", limit: int = 82) -> str:
+    if not values:
+        return fallback
+    shown: list[str] = []
+    for index, value in enumerate(values):
+        remaining = len(values) - index - 1
+        suffix = f" +{remaining} more" if remaining else ""
+        candidate = ", ".join([*shown, value]) + suffix
+        if shown and len(candidate) > limit:
+            return ", ".join(shown) + f" +{len(values) - len(shown)} more"
+        shown.append(value)
+    return ", ".join(shown)
+
+
 def draw_cover(c, args, report_date, scoped, results, evidence, campaign_info):
     c.setFillColor(PURPLE)
     c.rect(0, 0, W, H, fill=1, stroke=0)
@@ -422,7 +486,17 @@ def draw_summary(c, args, report_date, scope_ids, scoped, results):
         "All selected tests have a latest passing execution in the current XML result set."
     )
     paragraph(c, note, 624, 211, W - 624 - MARGIN - 12, 11, 16, MUTED, max_lines=5)
-    text(c, f"Evidence: all {len(results)} XML executions considered; latest outcome per selected test ID.", 624, 132, 8, MUTED)
+    paragraph(
+        c,
+        f"Evidence: all {len(results)} XML executions considered; latest outcome per selected test ID.",
+        624,
+        139,
+        W - 624 - MARGIN - 14,
+        8,
+        11,
+        MUTED,
+        max_lines=2,
+    )
     footer(c, 3, args.project, report_date)
     c.showPage()
 
@@ -596,7 +670,7 @@ def draw_gaps(c, args, report_date, scope_ids, scoped, rows, page_number):
     c.showPage()
 
 
-def draw_traceability(c, args, report_date, scoped, results, evidence):
+def draw_traceability(c, args, report_date, scoped, results, evidence, qa_members):
     page_title(c, "01 / Configuration", "Test configuration from XML evidence",
                "Firmware, hardware and station information are taken only from the available test result XML files.")
     cards = [
@@ -626,7 +700,7 @@ def draw_traceability(c, args, report_date, scoped, results, evidence):
         ("Tester", joined(evidence["tester"])),
         ("Chambers", joined(evidence["chamber"])),
         ("Scope", args.scope.name),
-        ("XML results read", str(len(results))),
+        ("QA members", compact_joined(qa_members)),
     ]
     y = 244
     for label, value in environment:
@@ -683,11 +757,12 @@ def generate(args: argparse.Namespace) -> Path:
     rows = family_rows(scope_ids, scoped, labels)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     c = canvas.Canvas(str(args.output), pagesize=PAGE, pageCompression=1)
-    c.setTitle(f"{args.project} - {args.round_name} Test Report")
+    c.setTitle(safe_text(f"{args.project} - {args.round_name} Test Report"))
     c.setAuthor("PT Team")
     evidence = evidence_values(scoped)
+    qa_members = load_qa_member_names(args.scope, scoped)
     draw_cover(c, args, report_date, scoped, all_results, evidence, campaign_info)
-    draw_traceability(c, args, report_date, scoped, all_results, evidence)
+    draw_traceability(c, args, report_date, scoped, all_results, evidence, qa_members)
     draw_summary(c, args, report_date, scope_ids, scoped, all_results)
     draw_coverage(c, args, report_date, rows)
     failure_pages = draw_failures(c, args, report_date, scoped, rows)

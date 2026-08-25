@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<qaMembers>
+  <!-- Copy a member line and edit its id and name. IDs must be unique. -->
+  <member id="QA001" name="Dummy QA Member 1" />
+  <member id="QA002" name="Dummy QA Member 2" />
+  <member id="QA003" name="Dummy QA Member 3" />
+  <member id="QA004" name="Dummy QA Member 4" />
+</qaMembers>

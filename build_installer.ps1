@@ -45,4 +45,4 @@ if ($LASTEXITCODE -ne 0) { throw "Inno Setup could not build the installer." }
 
 Write-Host ""
 Write-Host "Installer created:" -ForegroundColor Green
-Write-Host (Join-Path $ProjectRoot "release\Tridonic-One4All-Viewer-Setup-1.0.exe")
+Write-Host (Join-Path $ProjectRoot "release\Tridonic-One4All-Viewer-Setup-1.2.exe")

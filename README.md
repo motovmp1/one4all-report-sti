@@ -2,7 +2,7 @@
 
 A PySide6 desktop application for reviewing One4All XML test results.
 
-Branded as **TRIDONIC — WE MANAGE LIGHT**, Version 1.0, powered by PT Team.
+Branded as **TRIDONIC — WE MANAGE LIGHT**, Version 1.2, powered by PT Team.
 
 ## Tools used and tested
 
@@ -20,7 +20,7 @@ final Setup `.exe` do not need Python, pip, PySide6, PyInstaller, or Inno Setup.
 
 ### Changes made on the current build computer
 
-During creation of the Version 1.0 installer:
+During creation of the Version 1.2 installer:
 
 - the existing Python 3.14.6 and project `.venv` were used;
 - PyInstaller 6.21.0 and its build dependencies were installed inside `.venv`
@@ -96,7 +96,7 @@ the `test_scope.xml` file next to `main.py` when available.
 Share this file with users who do not have Python installed:
 
 ```text
-release\Tridonic-One4All-Viewer-Setup-1.0.exe
+release\Tridonic-One4All-Viewer-Setup-1.2.exe
 ```
 
 The installer contains Python, PySide6, and all runtime dependencies. It installs
@@ -127,14 +127,14 @@ The build script performs these steps automatically:
 The finished installer is written to:
 
 ```text
-release\Tridonic-One4All-Viewer-Setup-1.0.exe
+release\Tridonic-One4All-Viewer-Setup-1.2.exe
 ```
 
 Confirm that it exists and calculate its checksum with:
 
 ```powershell
-Get-Item .\release\Tridonic-One4All-Viewer-Setup-1.0.exe
-Get-FileHash .\release\Tridonic-One4All-Viewer-Setup-1.0.exe -Algorithm SHA256
+Get-Item .\release\Tridonic-One4All-Viewer-Setup-1.2.exe
+Get-FileHash .\release\Tridonic-One4All-Viewer-Setup-1.2.exe -Algorithm SHA256
 ```
 
 To change the public version number, update it consistently in:
@@ -168,6 +168,22 @@ installer; no manual PyInstaller or Inno Setup command is required.
 - completed scans remain visible when filesystem changes queue another refresh;
 - Passed, Failed, Skipped, Aborted, Draft, and Unknown states;
 - search and status filters;
+- static, aligned **QA member** and **QA comment** columns in the overview table;
+- QA members, task assignments, and **QA comments** live only in
+  `One4All_QA_data.xml`, beside the selected `test_scope.xml`;
+- the QA XML is created only when a user first adds a member or saves QA data;
+  `Test_report_data.xml` is legacy data and is never read or modified by this feature;
+- result-step comments remain only in the detailed Steps table and are never
+  copied into the initial overview;
+- inside a test's detail **Overview**, QA member and QA comment each have their own
+  nearby **Edit**, **Save**, **Cancel**, and **Remove** actions; clicking the displayed
+  member or comment also opens its editor, and QA editing provides **+ Add QA**;
+- generated meeting reports list the QA members assigned to the latest scoped results
+  in the **Configuration / Test environment** panel;
+- mapped network drives such as `Z:` and UNC paths show a persistent English banner
+  with indeterminate discovery and determinate XML-reading progress;
+- scope/QA loading, result/detail scanning, QA writes, and PDF input reads run outside
+  the UI thread; failed network operations offer **Retry** after checking VPN access;
 - a one-second pulsing active-filter warning with one-click filter clearing;
 - automatic totals and percentages;
 - responsive Distribution panel for standard and high-DPI Windows displays,

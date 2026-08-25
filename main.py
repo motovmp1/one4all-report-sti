@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -18,6 +19,7 @@ from PySide6.QtCore import (
     QObject,
     QRectF,
     QRunnable,
+    QSize,
     QSortFilterProxyModel,
     QPropertyAnimation,
     Qt,
@@ -36,6 +38,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -72,6 +75,188 @@ APP_DIR = (
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent
 )
+QA_DATA_FILE_NAME = "One4All_QA_data.xml"
+
+
+def normalized_path(path: Path) -> Path:
+    """Make a path absolute without resolving it across a potentially slow network."""
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def is_network_path(path: Path | None) -> bool:
+    if path is None:
+        return False
+    value = os.fspath(path)
+    if value.startswith(("\\\\", "//")):
+        return True
+    drive = Path(value).drive
+    if drive.upper() == "Z:":
+        return True
+    if os.name == "nt" and drive:
+        try:
+            import ctypes
+
+            return ctypes.windll.kernel32.GetDriveTypeW(f"{drive}\\") == 4
+        except (AttributeError, OSError):
+            pass
+    return False
+
+
+def network_location_name(path: Path) -> str:
+    value = os.fspath(path)
+    if value.startswith(("\\\\", "//")):
+        return "Network location"
+    return f"Network drive {path.drive}" if path.drive else "Network location"
+
+
+@dataclass(frozen=True, slots=True)
+class QAMember:
+    member_id: str
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class QAAssignment:
+    member_id: str = ""
+    qa_comment: str = ""
+
+
+class QAMemberStore:
+    """Scope-local QA members, assignments and comments in an app-owned XML."""
+
+    def __init__(self):
+        self.members: list[QAMember] = []
+        self.assignments: dict[str, QAAssignment] = {}
+        self.data_file: Path | None = None
+        self.warning = ""
+
+    def reload(self):
+        self.members = []
+        self.assignments = {}
+        self.warning = ""
+        path = self.data_file
+        if not path or not path.is_file():
+            return
+        try:
+            root = ET.parse(path).getroot()
+            seen: set[str] = set()
+            for element in root.findall("./QAMembers/Member"):
+                member_id = (element.get("id") or "").strip()
+                name = (element.get("name") or "").strip()
+                if member_id and name and member_id.casefold() not in seen:
+                    self.members.append(QAMember(member_id, name))
+                    seen.add(member_id.casefold())
+            for element in root.findall("./Tests/Test"):
+                result_name = (element.get("result") or "").strip()
+                member_id = (element.get("qaMemberId") or "").strip()
+                comment = element.findtext("Comment", default="").strip()
+                if result_name:
+                    self.assignments[result_name.casefold()] = QAAssignment(member_id, comment)
+        except (OSError, ET.ParseError) as exc:
+            self.warning = f"{QA_DATA_FILE_NAME} could not be read: {exc}"
+
+    def set_data_file(self, path: Path | None):
+        self.data_file = normalized_path(path) if path else None
+        self.reload()
+
+    def set_loaded_data(
+        self,
+        path: Path | None,
+        members: list[QAMember],
+        assignments: dict[str, QAAssignment],
+        warning: str = "",
+    ):
+        self.data_file = normalized_path(path) if path else None
+        self.members = members
+        self.assignments = assignments
+        self.warning = warning
+
+    def _load_or_create_tree(self) -> tuple[ET.ElementTree, ET.Element]:
+        path = self.data_file
+        if path is None:
+            raise OSError("Select the matching test_scope.xml before saving QA data.")
+        if path.is_file():
+            try:
+                tree = ET.parse(path)
+            except ET.ParseError as exc:
+                raise OSError(f"{QA_DATA_FILE_NAME} is not valid XML: {exc}") from exc
+            root = tree.getroot()
+            if root.tag != "One4AllQAData":
+                raise OSError(f"{QA_DATA_FILE_NAME} has an unsupported root element.")
+        else:
+            root = ET.Element("One4AllQAData", version="1")
+            tree = ET.ElementTree(root)
+        return tree, root
+
+    def _write_tree(self, tree: ET.ElementTree):
+        path = self.data_file
+        if path is None:
+            raise OSError("Select the matching test_scope.xml before saving QA data.")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ET.indent(tree, space="  ")
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        tree.write(temporary, encoding="utf-8", xml_declaration=True)
+        temporary.replace(path)
+        self.reload()
+
+    def add_member(self, name: str) -> QAMember:
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("Enter a QA name.")
+        existing = next(
+            (item for item in self.members if item.name.casefold() == clean_name.casefold()), None
+        )
+        if existing:
+            return existing
+        tree, root = self._load_or_create_tree()
+        members_node = root.find("QAMembers")
+        if members_node is None:
+            members_node = ET.SubElement(root, "QAMembers")
+        used_numbers = {
+            int(match.group(1))
+            for item in self.members
+            if (match := re.fullmatch(r"QA(\d+)", item.member_id, re.I))
+        }
+        number = 1
+        while number in used_numbers:
+            number += 1
+        member = QAMember(f"QA{number:03d}", clean_name)
+        ET.SubElement(members_node, "Member", id=member.member_id, name=member.name)
+        self._write_tree(tree)
+        return self.member_by_id(member.member_id) or member
+
+    def member_by_id(self, member_id: str) -> QAMember | None:
+        wanted = member_id.casefold().strip()
+        return next((member for member in self.members if member.member_id.casefold() == wanted), None)
+
+    def assignment_for(self, path: Path) -> QAAssignment:
+        return self.assignments.get(path.name.casefold(), QAAssignment())
+
+    def resolved_member(self, path: Path) -> QAMember | None:
+        return self.member_by_id(self.assignment_for(path).member_id)
+
+    def _assignment_element(self, root: ET.Element, path: Path) -> ET.Element:
+        tests_node = root.find("Tests")
+        if tests_node is None:
+            tests_node = ET.SubElement(root, "Tests")
+        for element in tests_node.findall("Test"):
+            if (element.get("result") or "").strip().casefold() == path.name.casefold():
+                return element
+        return ET.SubElement(tests_node, "Test", result=path.name)
+
+    def assign_member(self, path: Path, member_id: str):
+        tree, root = self._load_or_create_tree()
+        self._assignment_element(root, path).set("qaMemberId", member_id.strip())
+        self._write_tree(tree)
+
+    def assign_comment(self, path: Path, qa_comment: str):
+        tree, root = self._load_or_create_tree()
+        element = self._assignment_element(root, path)
+        comment = element.find("Comment")
+        if comment is None:
+            comment = ET.SubElement(element, "Comment")
+        comment.text = qa_comment.strip()
+        self._write_tree(tree)
 
 
 def copy_path_icon() -> QIcon:
@@ -83,6 +268,35 @@ def copy_path_icon() -> QIcon:
     painter.setPen(QPen(QColor("#3E63A8"), 1.6))
     painter.drawRoundedRect(QRectF(6, 3, 9, 11), 1.5, 1.5)
     painter.drawRoundedRect(QRectF(3, 6, 9, 9), 1.5, 1.5)
+    painter.end()
+    return QIcon(pixmap)
+
+
+def edit_details_icon() -> QIcon:
+    pixmap = QPixmap(22, 22)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setPen(QPen(QColor("#3974D8"), 2.4, Qt.SolidLine, Qt.RoundCap))
+    painter.drawLine(5, 17, 16, 6)
+    painter.drawLine(7, 19, 18, 8)
+    painter.setPen(QPen(QColor("#6B7C96"), 1.4))
+    painter.drawLine(4, 19, 8, 18)
+    painter.end()
+    return QIcon(pixmap)
+
+
+def save_details_icon() -> QIcon:
+    pixmap = QPixmap(22, 22)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setPen(QPen(QColor("#FFFFFF"), 1.8))
+    painter.setBrush(QColor("#4F9A7D"))
+    painter.drawRoundedRect(QRectF(3, 3, 16, 16), 2, 2)
+    painter.setBrush(QColor("#FFFFFF"))
+    painter.drawRect(QRectF(6, 5, 8, 5))
+    painter.drawRect(QRectF(6, 13, 10, 4))
     painter.end()
     return QIcon(pixmap)
 
@@ -143,9 +357,13 @@ class TestRecord:
     sw_version: str = ""
     hw_version: str = ""
     chamber: str = ""
+    qa_member_id: str = ""
+    qa_member_name: str = ""
+    qa_comment: str = ""
     evaluations: list[Evaluation] = field(default_factory=list)
     parse_warning: str = ""
     details_loaded: bool = True
+    raw_xml: str = ""
 
     @property
     def failed_evaluations(self) -> list[Evaluation]:
@@ -155,6 +373,7 @@ class TestRecord:
             if item.result not in ("", "0") or any(x in marker for x in ("fail", "error", "wrong")):
                 failures.append(item)
         return failures
+
 
 
 @dataclass(slots=True)
@@ -167,7 +386,7 @@ class ScopeGroup:
 def scan_test_scope(scope_file: Path) -> list[ScopeGroup]:
     """Read the exact selected test IDs from a Test Manager test_scope.xml."""
     if not scope_file.is_file():
-        return []
+        raise FileNotFoundError(f"Test scope is unavailable: {scope_file}")
     raw, _ = read_xml_text(scope_file)
     root = ET.fromstring(raw)
     groups = [ScopeGroup(name, folder_id, set()) for folder_id, name in FIXED_SCOPE_GROUPS]
@@ -268,6 +487,7 @@ def parse_result(path: Path, include_evaluations: bool = True) -> TestRecord:
 
     test_block_match = re.search(r"<TEST\b[^>]*>([\s\S]*?)</TEST>", raw, re.I)
     info = _data_values(test_block_match.group(1)) if test_block_match else {}
+    evaluation_blocks = EVAL_RE.findall(raw)
     evaluations = []
     if include_evaluations:
         step_details: dict[tuple[str, str], list[dict[str, str]]] = {}
@@ -276,7 +496,7 @@ def parse_result(path: Path, include_evaluations: bool = True) -> TestRecord:
             key = (values.get("TestID", ""), values.get("StepID", ""))
             step_details.setdefault(key, []).append(values)
         step_offsets: dict[tuple[str, str], int] = {}
-        for block in EVAL_RE.findall(raw):
+        for block in evaluation_blocks:
             values = _data_values(block)
             key = (values.get("TestID", ""), values.get("StepID", ""))
             candidates = step_details.get(key, [])
@@ -303,8 +523,10 @@ def parse_result(path: Path, include_evaluations: bool = True) -> TestRecord:
         status=status, is_draft=draft, started=started, stopped=stopped,
         duration_seconds=duration, dut=info.get("DUT", ""), tester=info.get("Tester ID", ""),
         sw_version=info.get("SW version of DUT", ""), hw_version=info.get("HW version of DUT", ""),
-        chamber=info.get("Temperature chamber", ""), evaluations=evaluations, parse_warning=warning,
+        chamber=info.get("Temperature chamber", ""),
+        evaluations=evaluations, parse_warning=warning,
         details_loaded=include_evaluations,
+        raw_xml=raw if include_evaluations else "",
     )
 
 
@@ -365,7 +587,7 @@ class DetailJob(QRunnable):
         except Exception as exc:
             record, error = None, str(exc)
         try:
-            self.signals.finished.emit(record, error, str(self.path.resolve()))
+            self.signals.finished.emit(record, error, str(normalized_path(self.path)))
         except RuntimeError:
             pass
 
@@ -394,17 +616,93 @@ class ReportJob(QRunnable):
             pass
 
 
-class ResultsModel(QAbstractTableModel):
-    columns = ("ID", "Test", "Status", "Duration", "Date", "Tester", "DUT")
+class ScopeLoadSignals(QObject):
+    finished = Signal(object, str, object)
 
-    def __init__(self):
+
+class ScopeLoadJob(QRunnable):
+    def __init__(self, path: Path):
         super().__init__()
+        self.path = path
+        self.signals = ScopeLoadSignals()
+
+    def run(self):
+        try:
+            groups = scan_test_scope(self.path)
+            if not groups or not any(group.test_ids for group in groups):
+                raise ValueError("The selected XML does not contain any valid selected tests.")
+            qa_path = self.path.parent / QA_DATA_FILE_NAME
+            qa_store = QAMemberStore()
+            qa_store.set_data_file(qa_path)
+            payload = (groups, list(qa_store.members), dict(qa_store.assignments), qa_store.warning)
+            error = ""
+        except Exception as exc:
+            payload, error = None, str(exc)
+        try:
+            self.signals.finished.emit(payload, error, self.path)
+        except RuntimeError:
+            pass
+
+
+class QAOperationSignals(QObject):
+    finished = Signal(object, str)
+
+
+class QAOperationJob(QRunnable):
+    def __init__(self, store: QAMemberStore, action: str, *values):
+        super().__init__()
+        self.store = store
+        self.action = action
+        self.values = values
+        self.signals = QAOperationSignals()
+
+    def run(self):
+        try:
+            if self.action == "add_member":
+                result = self.store.add_member(*self.values)
+            elif self.action == "assign_member":
+                self.store.assign_member(*self.values)
+                result = self.values[-1]
+            elif self.action == "assign_comment":
+                self.store.assign_comment(*self.values)
+                result = self.values[-1]
+            else:
+                raise ValueError(f"Unsupported QA operation: {self.action}")
+            error = ""
+        except Exception as exc:
+            result, error = None, str(exc)
+        try:
+            self.signals.finished.emit(result, error)
+        except RuntimeError:
+            pass
+
+
+class ResultsModel(QAbstractTableModel):
+    columns = (
+        "ID", "Test", "Status", "Duration", "Date", "Tester", "DUT",
+        "QA member", "QA comment",
+    )
+    QA_COLUMN = 7
+    QA_COMMENT_COLUMN = 8
+
+    def __init__(self, qa_store: QAMemberStore):
+        super().__init__()
+        self.qa_store = qa_store
         self.records: list[TestRecord] = []
 
     def set_records(self, records: list[TestRecord]):
         self.beginResetModel()
+        for record in records:
+            self.hydrate_record(record)
         self.records = records
         self.endResetModel()
+
+    def hydrate_record(self, record: TestRecord):
+        assignment = self.qa_store.assignment_for(record.path)
+        member = self.qa_store.resolved_member(record.path)
+        record.qa_member_id = member.member_id if member else assignment.member_id
+        record.qa_member_name = member.name if member else assignment.member_id
+        record.qa_comment = assignment.qa_comment
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.records)
@@ -425,9 +723,16 @@ class ResultsModel(QAbstractTableModel):
             record.test_id, record.title, STATUS_META[record.status][0],
             format_duration(record.duration_seconds),
             record.started.strftime("%d/%m/%Y %H:%M") if record.started else "—",
-            record.tester or "—", record.dut or "—",
+            record.tester or "-", record.dut or "-", record.qa_member_name or "Select QA member...",
+            record.qa_comment or "-",
         )
         if role == Qt.DisplayRole:
+            return values[index.column()]
+        if role == Qt.EditRole:
+            if index.column() == self.QA_COLUMN:
+                return record.qa_member_id
+            if index.column() == self.QA_COMMENT_COLUMN:
+                return record.qa_comment
             return values[index.column()]
         if role == Qt.UserRole:
             return record
@@ -438,8 +743,37 @@ class ResultsModel(QAbstractTableModel):
             font.setBold(True)
             return font
         if role == Qt.ToolTipRole:
+            if index.column() == self.QA_COMMENT_COLUMN:
+                return record.qa_comment or "No QA comment"
             return record.file_name
         return None
+
+    def flags(self, index):
+        return super().flags(index)
+
+    def setData(self, index, value, role=Qt.EditRole):
+        if (
+            not index.isValid()
+            or index.column() not in (self.QA_COLUMN, self.QA_COMMENT_COLUMN)
+            or role != Qt.EditRole
+        ):
+            return False
+        record = self.records[index.row()]
+        if index.column() == self.QA_COLUMN:
+            member = self.qa_store.member_by_id(str(value))
+            record.qa_member_id = member.member_id if member else ""
+            record.qa_member_name = member.name if member else ""
+        else:
+            record.qa_comment = str(value).strip()
+        try:
+            if index.column() == self.QA_COLUMN:
+                self.qa_store.assign_member(record.path, record.qa_member_id)
+            else:
+                self.qa_store.assign_comment(record.path, record.qa_comment)
+        except OSError:
+            return False
+        self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
+        return True
 
 
 class ResultsProxy(QSortFilterProxyModel):
@@ -462,7 +796,10 @@ class ResultsProxy(QSortFilterProxyModel):
         model: ResultsModel = self.sourceModel()
         record = model.records[source_row]
         status_ok = self.status == "all" or record.status == self.status
-        text = f"{record.test_id} {record.title} {record.file_name} {record.dut} {record.tester}".casefold()
+        text = (
+            f"{record.test_id} {record.title} {record.file_name} {record.dut} "
+            f"{record.tester} {record.qa_member_name} {record.qa_comment}"
+        ).casefold()
         return status_ok and (not self.query or self.query in text)
 
 
@@ -733,9 +1070,41 @@ def info_row(label: str, value: str) -> QWidget:
     return widget
 
 
+class ClickableLabel(QLabel):
+    clicked = Signal()
+
+    def sizeHint(self) -> QSize:
+        hint = super().sizeHint()
+        if self.wordWrap():
+            single_line = " ".join(self.text().split())
+            natural_width = self.fontMetrics().horizontalAdvance(single_line) + 12
+            hint.setWidth(min(self.maximumWidth(), natural_width))
+        return hint
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 class DetailPage(QWidget):
-    def __init__(self, record: TestRecord):
+    qa_assignment_changed = Signal(object)
+    network_operation_started = Signal(object, str)
+    network_operation_finished = Signal()
+
+    def __init__(
+        self,
+        record: TestRecord,
+        qa_store: QAMemberStore,
+        qa_pool: QThreadPool | None = None,
+    ):
         super().__init__()
+        self.record = record
+        self.qa_store = qa_store
+        self.qa_pool = qa_pool
+        self._qa_job: QAOperationJob | None = None
+        self.editing_member = False
+        self.editing_comment = False
         layout = QVBoxLayout(self); layout.setContentsMargins(28, 24, 28, 24); layout.setSpacing(16)
         header = QHBoxLayout()
         titles = QVBoxLayout()
@@ -754,6 +1123,97 @@ class DetailPage(QWidget):
         ov.addWidget(info_row("Duration", format_duration(record.duration_seconds)))
         ov.addWidget(info_row("DUT", record.dut))
         ov.addWidget(info_row("Tester", record.tester))
+        qa_row = QWidget()
+        qa_layout = QHBoxLayout(qa_row); qa_layout.setContentsMargins(0, 4, 0, 4)
+        qa_label = QLabel("QA member"); qa_label.setObjectName("muted"); qa_label.setMinimumWidth(145)
+        self.qa_value = ClickableLabel(record.qa_member_name or "Not assigned")
+        self.qa_value.setObjectName("editableDetailValue")
+        self.qa_value.setCursor(Qt.PointingHandCursor)
+        self.qa_value.setToolTip("Click to edit the QA member")
+        self.qa_value.clicked.connect(self._start_member_edit)
+        self.qa_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.qa_combo = QComboBox()
+        self.qa_combo.setMaximumWidth(420)
+        self.qa_combo.addItem("Not assigned", "")
+        for member in self.qa_store.members:
+            self.qa_combo.addItem(f"{member.name} ({member.member_id})", member.member_id)
+        selected = self.qa_combo.findData(record.qa_member_id)
+        self.qa_combo.setCurrentIndex(max(0, selected))
+        self.qa_combo.hide()
+        self.add_qa_button = QPushButton("+ Add QA")
+        self.add_qa_button.setObjectName("detailAddButton")
+        self.add_qa_button.clicked.connect(self._add_qa_member)
+        self.add_qa_button.hide()
+        self.qa_edit_button = QPushButton("Edit")
+        self.qa_edit_button.setObjectName("detailEditButton")
+        self.qa_edit_button.setIcon(edit_details_icon())
+        self.qa_edit_button.clicked.connect(self._start_member_edit)
+        self.qa_save_button = QPushButton("Save")
+        self.qa_save_button.setObjectName("detailSaveButton")
+        self.qa_save_button.setIcon(save_details_icon())
+        self.qa_save_button.clicked.connect(self._save_member)
+        self.qa_save_button.hide()
+        self.qa_cancel_button = QPushButton("Cancel")
+        self.qa_cancel_button.setObjectName("detailCancelButton")
+        self.qa_cancel_button.clicked.connect(self._cancel_member_edit)
+        self.qa_cancel_button.hide()
+        self.qa_remove_button = QPushButton("Remove")
+        self.qa_remove_button.setObjectName("detailRemoveButton")
+        self.qa_remove_button.setToolTip("Remove the QA member from this task")
+        self.qa_remove_button.clicked.connect(self._remove_member_assignment)
+        self.qa_remove_button.hide()
+        qa_layout.addWidget(qa_label)
+        qa_layout.addWidget(self.qa_value)
+        qa_layout.addWidget(self.qa_combo)
+        qa_layout.addWidget(self.qa_edit_button)
+        qa_layout.addWidget(self.add_qa_button)
+        qa_layout.addWidget(self.qa_save_button)
+        qa_layout.addWidget(self.qa_cancel_button)
+        qa_layout.addWidget(self.qa_remove_button)
+        qa_layout.addStretch(1)
+        ov.addWidget(qa_row)
+        comments_row = QWidget()
+        comments_layout = QHBoxLayout(comments_row); comments_layout.setContentsMargins(0, 4, 0, 4)
+        comments_label = QLabel("QA comment"); comments_label.setObjectName("muted"); comments_label.setMinimumWidth(145)
+        self.comments_value = ClickableLabel(self._display_comment(record.qa_comment))
+        self.comments_value.setObjectName("editableDetailValue")
+        self.comments_value.setCursor(Qt.PointingHandCursor)
+        self.comments_value.setToolTip("Click to edit the QA comment")
+        self.comments_value.clicked.connect(self._start_comment_edit)
+        self.comments_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.comments_value.setWordWrap(True)
+        self.comments_value.setMaximumWidth(900)
+        self.comments_editor = QPlainTextEdit()
+        self.comments_editor.setMaximumHeight(115)
+        self.comments_editor.setMaximumWidth(900)
+        self.comments_editor.hide()
+        self.comment_edit_button = QPushButton("Edit")
+        self.comment_edit_button.setObjectName("detailEditButton")
+        self.comment_edit_button.setIcon(edit_details_icon())
+        self.comment_edit_button.clicked.connect(self._start_comment_edit)
+        self.comment_save_button = QPushButton("Save")
+        self.comment_save_button.setObjectName("detailSaveButton")
+        self.comment_save_button.setIcon(save_details_icon())
+        self.comment_save_button.clicked.connect(self._save_comment)
+        self.comment_save_button.hide()
+        self.comment_cancel_button = QPushButton("Cancel")
+        self.comment_cancel_button.setObjectName("detailCancelButton")
+        self.comment_cancel_button.clicked.connect(self._cancel_comment_edit)
+        self.comment_cancel_button.hide()
+        self.comment_remove_button = QPushButton("Remove")
+        self.comment_remove_button.setObjectName("detailRemoveButton")
+        self.comment_remove_button.setToolTip("Remove the QA comment from this task")
+        self.comment_remove_button.clicked.connect(self._remove_comment)
+        self.comment_remove_button.hide()
+        comments_layout.addWidget(comments_label)
+        comments_layout.addWidget(self.comments_value)
+        comments_layout.addWidget(self.comments_editor)
+        comments_layout.addWidget(self.comment_edit_button)
+        comments_layout.addWidget(self.comment_save_button)
+        comments_layout.addWidget(self.comment_cancel_button)
+        comments_layout.addWidget(self.comment_remove_button)
+        comments_layout.addStretch(1)
+        ov.addWidget(comments_row)
         ov.addWidget(info_row("SW / HW version", f"{record.sw_version or '—'} / {record.hw_version or '—'}"))
         ov.addWidget(info_row("Chamber", record.chamber))
         ov.addWidget(info_row("Evaluations", f"{len(record.evaluations)} total · {len(record.failed_evaluations)} failed"))
@@ -839,11 +1299,200 @@ class DetailPage(QWidget):
         inner.addTab(failures_page, f"Failures ({len(record.failed_evaluations)})")
 
         raw = QPlainTextEdit(); raw.setReadOnly(True); raw.setLineWrapMode(QPlainTextEdit.NoWrap)
-        try: raw.setPlainText(read_xml_text(record.path)[0])
-        except OSError as exc: raw.setPlainText(f"The file could not be opened:\n{exc}")
+        raw.setPlainText(record.raw_xml or "Original XML is not available.")
         raw.setFont(QFont("Cascadia Mono", 9))
         inner.addTab(raw, "Original XML")
         layout.addWidget(inner, 1)
+
+    def _require_scope(self) -> bool:
+        if self.qa_store.data_file is not None:
+            return True
+        QMessageBox.information(
+            self,
+            "Test scope required",
+            "Select the matching test_scope.xml before editing QA data.",
+        )
+        return False
+
+    @staticmethod
+    def _display_comment(value: str) -> str:
+        return " ".join(value.split()) or "-"
+
+    def _reload_member_combo(self, selected_id: str = ""):
+        self.qa_combo.clear()
+        self.qa_combo.addItem("Not assigned", "")
+        for member in self.qa_store.members:
+            self.qa_combo.addItem(f"{member.name} ({member.member_id})", member.member_id)
+        selected = self.qa_combo.findData(selected_id)
+        self.qa_combo.setCurrentIndex(max(0, selected))
+
+    def _start_member_edit(self):
+        if not self._require_scope():
+            return
+        self.editing_member = True
+        self._reload_member_combo(self.record.qa_member_id)
+        self.qa_value.hide(); self.qa_edit_button.hide()
+        self.qa_combo.show(); self.add_qa_button.show()
+        self.qa_save_button.show(); self.qa_cancel_button.show(); self.qa_remove_button.show()
+        self.qa_remove_button.setEnabled(bool(self.record.qa_member_id))
+        self.qa_combo.setFocus()
+
+    def _cancel_member_edit(self):
+        self.editing_member = False
+        self.qa_combo.hide(); self.add_qa_button.hide()
+        self.qa_save_button.hide(); self.qa_cancel_button.hide(); self.qa_remove_button.hide()
+        self.qa_value.show(); self.qa_edit_button.show()
+
+    def _add_qa_member(self):
+        if not self._require_scope():
+            return
+        name, accepted = QInputDialog.getText(self, "Add QA member", "QA name:")
+        if not accepted:
+            return
+        self._run_qa_operation(
+            "add_member",
+            (name,),
+            "Adding QA member from the network.",
+            lambda member: self._reload_member_combo(member.member_id),
+            self._add_qa_member,
+        )
+
+    def _save_member(self):
+        member = self.qa_store.member_by_id(str(self.qa_combo.currentData()))
+        member_id = member.member_id if member else ""
+        self._run_qa_operation(
+            "assign_member",
+            (self.record.path, member_id),
+            "Saving the QA member to the network.",
+            lambda _result: self._member_saved(member),
+            self._save_member,
+        )
+
+    def _member_saved(self, member: QAMember | None):
+        member_id = member.member_id if member else ""
+        self.record.qa_member_id = member_id
+        self.record.qa_member_name = member.name if member else ""
+        self.qa_value.setText(self.record.qa_member_name or "Not assigned")
+        self._cancel_member_edit()
+        self.qa_assignment_changed.emit(self.record)
+
+    def _remove_member_assignment(self):
+        self._run_qa_operation(
+            "assign_member",
+            (self.record.path, ""),
+            "Removing the QA member from the network data.",
+            lambda _result: self._member_removed(),
+            self._remove_member_assignment,
+        )
+
+    def _member_removed(self):
+        self.record.qa_member_id = ""
+        self.record.qa_member_name = ""
+        self.qa_value.setText("Not assigned")
+        self._cancel_member_edit()
+        self.qa_assignment_changed.emit(self.record)
+
+    def _start_comment_edit(self):
+        if not self._require_scope():
+            return
+        self.editing_comment = True
+        self.comments_editor.setPlainText(self.record.qa_comment)
+        self.comments_value.hide(); self.comment_edit_button.hide()
+        self.comments_editor.show()
+        self.comment_save_button.show(); self.comment_cancel_button.show(); self.comment_remove_button.show()
+        self.comment_remove_button.setEnabled(bool(self.record.qa_comment))
+        self.comments_editor.setFocus()
+
+    def _cancel_comment_edit(self):
+        self.editing_comment = False
+        self.comments_editor.hide()
+        self.comment_save_button.hide(); self.comment_cancel_button.hide(); self.comment_remove_button.hide()
+        self.comments_value.show(); self.comment_edit_button.show()
+
+    def _save_comment(self):
+        qa_comment = self.comments_editor.toPlainText().strip()
+        self._run_qa_operation(
+            "assign_comment",
+            (self.record.path, qa_comment),
+            "Saving the QA comment to the network.",
+            lambda _result: self._comment_saved(qa_comment),
+            self._save_comment,
+        )
+
+    def _comment_saved(self, qa_comment: str):
+        self.record.qa_comment = qa_comment
+        self.comments_value.setText(self._display_comment(qa_comment))
+        self._cancel_comment_edit()
+        self.qa_assignment_changed.emit(self.record)
+
+    def _remove_comment(self):
+        self._run_qa_operation(
+            "assign_comment",
+            (self.record.path, ""),
+            "Removing the QA comment from the network data.",
+            lambda _result: self._comment_removed(),
+            self._remove_comment,
+        )
+
+    def _comment_removed(self):
+        self.record.qa_comment = ""
+        self.comments_value.setText("-")
+        self._cancel_comment_edit()
+        self.qa_assignment_changed.emit(self.record)
+
+    def _set_qa_controls_enabled(self, enabled: bool):
+        for button in (
+            self.add_qa_button,
+            self.qa_save_button,
+            self.qa_cancel_button,
+            self.qa_remove_button,
+            self.comment_save_button,
+            self.comment_cancel_button,
+            self.comment_remove_button,
+        ):
+            button.setEnabled(enabled)
+        self.qa_combo.setEnabled(enabled)
+        self.comments_editor.setEnabled(enabled)
+
+    def _run_qa_operation(self, action, values, activity, on_success, retry):
+        if self._qa_job is not None:
+            return
+        self._set_qa_controls_enabled(False)
+        network_active = is_network_path(self.qa_store.data_file)
+        if network_active:
+            self.network_operation_started.emit(self.qa_store.data_file, activity)
+        job = QAOperationJob(self.qa_store, action, *values)
+        self._qa_job = job
+
+        def finished(result, error):
+            self._qa_job = None
+            self._set_qa_controls_enabled(True)
+            if network_active:
+                self.network_operation_finished.emit()
+            if error:
+                self._show_qa_error(error, retry)
+                return
+            on_success(result)
+
+        job.signals.finished.connect(finished)
+        if self.qa_pool is None:
+            job.run()
+        else:
+            self.qa_pool.start(job)
+
+    def _show_qa_error(self, error: str, retry):
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setWindowTitle("Unable to update QA data")
+        message.setText(error)
+        retry_button = None
+        if is_network_path(self.qa_store.data_file):
+            message.setInformativeText("Check the VPN or network drive connection and try again.")
+            retry_button = message.addButton("Retry", QMessageBox.ButtonRole.AcceptRole)
+        message.addButton(QMessageBox.StandardButton.Cancel)
+        message.exec()
+        if retry_button is not None and message.clickedButton() is retry_button:
+            retry()
 
 
 class ScopeHelpDialog(QDialog):
@@ -974,6 +1623,44 @@ class DetailLoadingPage(QWidget):
         self.message.setText(error)
         self.message.setStyleSheet("color: #BD354D;")
         self.progress.hide()
+
+
+class NetworkBanner(QFrame):
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("networkBanner")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(18, 9, 18, 9)
+        layout.setSpacing(14)
+        icon = QLabel("NETWORK")
+        icon.setObjectName("networkBannerTag")
+        self.label = QLabel()
+        self.label.setObjectName("networkBannerText")
+        self.progress = QProgressBar()
+        self.progress.setObjectName("networkBannerProgress")
+        self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(8)
+        self.progress.setMaximumWidth(260)
+        layout.addWidget(icon)
+        layout.addWidget(self.label, 1)
+        layout.addWidget(self.progress)
+        self.hide()
+
+    def start(self, path: Path, action: str):
+        location = network_location_name(path)
+        self.label.setText(
+            f"{location} may take a little longer to load. {action} Please wait..."
+        )
+        self.progress.setRange(0, 0)
+        self.show()
+
+    def set_progress(self, current: int, total: int):
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(current)
+
+    def stop(self):
+        self.hide()
 
 
 class Dashboard(QWidget):
@@ -1114,11 +1801,15 @@ class Dashboard(QWidget):
         self.table = QTableView(); self.table.setModel(proxy); self.table.setSortingEnabled(True)
         self.table.setSelectionBehavior(QTableView.SelectRows); self.table.setSelectionMode(QTableView.SingleSelection)
         self.table.setEditTriggers(QTableView.NoEditTriggers); self.table.verticalHeader().hide()
-        self.table.setAlternatingRowColors(True); self.table.setShowGrid(False); self.table.verticalHeader().setDefaultSectionSize(36)
+        self.table.setAlternatingRowColors(True); self.table.setShowGrid(False); self.table.verticalHeader().setDefaultSectionSize(40)
         header = self.table.horizontalHeader(); header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents); header.setSectionResizeMode(1, QHeaderView.Stretch)
         for col in range(2, 6): header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.Stretch)
+        header.setSectionResizeMode(6, QHeaderView.Interactive)
+        header.setSectionResizeMode(7, QHeaderView.Interactive)
+        header.setSectionResizeMode(8, QHeaderView.Stretch)
+        self.table.setColumnWidth(6, 190)
+        self.table.setColumnWidth(7, 170)
         self.table.clicked.connect(self._open_index)
         tp.addWidget(self.table, 1)
         splitter.addWidget(table_panel)
@@ -1253,8 +1944,8 @@ class Dashboard(QWidget):
         self.status_filter.setCurrentIndex(0)
         self._filters_changed()
 
-    def start_loading(self):
-        self.loading_label.setText("Discovering XML results…")
+    def start_loading(self, message: str = "Discovering XML results…"):
+        self.loading_label.setText(message)
         self.loading_progress.setRange(0, 0)
         self.loading_panel.show()
 
@@ -1379,11 +2070,20 @@ class Dashboard(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Tridonic One4All Viewer — Version 1.0")
+        self.setWindowTitle("Tridonic One4All Viewer — Version 1.2")
         self.resize(1440, 900); self.setMinimumSize(1200, 760)
-        self.model = ResultsModel(); self.proxy = ResultsProxy(); self.proxy.setSourceModel(self.model)
+        self.qa_store = QAMemberStore()
+        self.model = ResultsModel(self.qa_store); self.proxy = ResultsProxy(); self.proxy.setSourceModel(self.model)
         self.tabs = QTabWidget(); self.tabs.setTabsClosable(True); self.tabs.setMovable(True)
-        self.tabs.tabCloseRequested.connect(self.close_tab); self.setCentralWidget(self.tabs)
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+        shell = QWidget()
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+        self.network_banner = NetworkBanner()
+        shell_layout.addWidget(self.network_banner)
+        shell_layout.addWidget(self.tabs, 1)
+        self.setCentralWidget(shell)
         self.dashboard = Dashboard(self.model, self.proxy)
         self.dashboard.choose_xml.connect(self.choose_xml)
         self.dashboard.choose_folder.connect(self.choose_folder); self.dashboard.refresh.connect(self.refresh)
@@ -1395,6 +2095,8 @@ class MainWindow(QMainWindow):
         self.refresh_timer = QTimer(self); self.refresh_timer.setSingleShot(True); self.refresh_timer.setInterval(650)
         self.refresh_timer.timeout.connect(self.refresh)
         self.pool = QThreadPool.globalInstance()
+        self.qa_pool = QThreadPool(self)
+        self.qa_pool.setMaxThreadCount(1)
         self.folder: Path | None = None
         self.source_path: Path | None = None
         self.scope_file: Path | None = None
@@ -1404,7 +2106,10 @@ class MainWindow(QMainWindow):
         self.pending_refresh = False
         self._detail_jobs: dict[str, DetailJob] = {}
         self._report_job: ReportJob | None = None
-        version_label = QLabel("VERSION 1.0")
+        self._scope_job: ScopeLoadJob | None = None
+        self._scope_job_silent = False
+        self._network_activity_count = 0
+        version_label = QLabel("VERSION 1.2")
         version_label.setObjectName("footerMeta")
         powered_label = QLabel("POWERED BY PT TEAM")
         powered_label.setObjectName("footerBrand")
@@ -1424,8 +2129,33 @@ class MainWindow(QMainWindow):
         if self.source_path is None and self.default_results.is_dir():
             self.set_folder(self.default_results)
 
+    def _network_start(self, path: Path | None, action: str):
+        if not is_network_path(path):
+            return
+        self._network_activity_count += 1
+        self.network_banner.start(path, action)
+
+    def _network_stop(self, path: Path | None = None):
+        if path is not None and not is_network_path(path):
+            return
+        self._network_activity_count = max(0, self._network_activity_count - 1)
+        if self._network_activity_count == 0:
+            self.network_banner.stop()
+
+    def _offer_network_retry(self, title: str, error: str, retry):
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setWindowTitle(title)
+        message.setText(error)
+        message.setInformativeText("Check the VPN or network drive connection and try again.")
+        retry_button = message.addButton("Retry", QMessageBox.ButtonRole.AcceptRole)
+        message.addButton(QMessageBox.StandardButton.Cancel)
+        message.exec()
+        if message.clickedButton() is retry_button:
+            retry()
+
     def set_folder(self, folder: Path):
-        folder = folder.resolve()
+        folder = normalized_path(folder)
         self.folder = folder
         self.source_path = folder
         old = self.watcher.directories()
@@ -1435,15 +2165,16 @@ class MainWindow(QMainWindow):
         # Avoid a second recursive walk on the UI thread. The worker still scans
         # XML files recursively; the watcher covers the root and direct folders.
         watched = [str(folder)]
-        try:
-            watched.extend(str(path) for path in folder.iterdir() if path.is_dir())
-        except OSError:
-            pass
+        if not is_network_path(folder):
+            try:
+                watched.extend(str(path) for path in folder.iterdir() if path.is_dir())
+            except OSError:
+                pass
         self.watcher.addPaths(watched); self.refresh()
 
     def set_file(self, file_path: Path):
-        file_path = file_path.resolve()
-        if not file_path.is_file() or file_path.suffix.lower() != ".xml":
+        file_path = normalized_path(file_path)
+        if file_path.suffix.lower() != ".xml":
             QMessageBox.warning(self, "Invalid file", "Please select a valid XML file.")
             return
         self.folder = file_path.parent
@@ -1477,7 +2208,7 @@ class MainWindow(QMainWindow):
                 chosen = Path(selected[0])
                 # If an XML was highlighted for inspection, use its containing
                 # folder because report generation always works at folder level.
-                if chosen.is_file():
+                if chosen.suffix.lower() == ".xml":
                     chosen = chosen.parent
                 self.set_folder(chosen)
 
@@ -1493,23 +2224,45 @@ class MainWindow(QMainWindow):
             self.set_scope_file(Path(chosen))
 
     def set_scope_file(self, scope_file: Path, silent: bool = False):
-        scope_file = scope_file.resolve()
-        try:
-            groups = scan_test_scope(scope_file)
-        except (OSError, ET.ParseError, UnicodeError) as exc:
-            if not silent:
-                QMessageBox.warning(self, "Invalid test scope", f"The scope XML could not be read:\n{exc}")
+        scope_file = normalized_path(scope_file)
+        self._scope_job_path = scope_file
+        self._scope_job_silent = silent
+        self.dashboard.start_loading("Loading test scope and QA data…")
+        self._network_start(scope_file, "Loading the test scope and QA data.")
+        job = ScopeLoadJob(scope_file)
+        self._scope_job = job
+        job.signals.finished.connect(self._scope_loaded)
+        self.pool.start(job)
+
+    def _scope_loaded(self, payload, error: str, loaded_path):
+        loaded_path = normalized_path(Path(loaded_path))
+        self._network_stop(loaded_path)
+        if loaded_path != getattr(self, "_scope_job_path", None):
             return
-        if not groups or not any(group.test_ids for group in groups):
-            if not silent:
+        self._scope_job = None
+        self.dashboard.stop_loading()
+        if error:
+            if self._scope_job_silent:
+                self.statusBar().showMessage(f"Test scope could not be loaded: {error}", 6000)
+            elif is_network_path(loaded_path):
+                self._offer_network_retry(
+                    "Unable to load test scope",
+                    error,
+                    lambda: self.set_scope_file(loaded_path),
+                )
+            else:
                 QMessageBox.warning(
-                    self,
-                    "Empty test scope",
-                    "The selected XML does not contain any valid selected tests.",
+                    self, "Invalid test scope", f"The scope XML could not be read:\n{error}"
                 )
             return
-        self.scope_file = scope_file
+        groups, members, assignments, warning = payload
+        self.scope_file = loaded_path
         self.scope_groups = groups
+        self.qa_store.set_loaded_data(
+            loaded_path.parent / QA_DATA_FILE_NAME, members, assignments, warning
+        )
+        if self.model.records:
+            self.model.set_records(list(self.model.records))
         if self.source_path:
             self.dashboard.update_data(
                 self.source_path, self.model.records, self.scope_file, self.scope_groups
@@ -1524,8 +2277,13 @@ class MainWindow(QMainWindow):
             )
 
     def clear_scope(self):
+        self._scope_job_path = None
+        self.dashboard.stop_loading()
         self.scope_file = None
         self.scope_groups = []
+        self.qa_store.set_data_file(None)
+        if self.model.records:
+            self.model.set_records(list(self.model.records))
         if self.source_path:
             self.dashboard.update_data(self.source_path, self.model.records, None, [])
         else:
@@ -1550,14 +2308,14 @@ class MainWindow(QMainWindow):
     def generate_pdf_report(self):
         if self.reporting:
             return
-        if not self.source_path or not self.source_path.is_dir():
+        if not self.source_path or self.source_path.suffix.lower() == ".xml":
             QMessageBox.warning(
                 self,
                 "Results folder required",
                 "Select the complete results folder before generating the PDF report.",
             )
             return
-        if not self.scope_file or not self.scope_file.is_file():
+        if not self.scope_file:
             QMessageBox.warning(
                 self,
                 "Test scope required",
@@ -1568,6 +2326,10 @@ class MainWindow(QMainWindow):
         self.reporting = True
         self.dashboard.set_report_generating(True)
         self.statusBar().showMessage("Generating meeting PDF...")
+        self._report_network_path = (
+            self.source_path if is_network_path(self.source_path) else self.scope_file
+        )
+        self._network_start(self._report_network_path, "Reading network data for the PDF report.")
         output_dir = APP_DIR / "output" / "pdf"
         job = ReportJob(self.source_path, self.scope_file, output_dir)
         self._report_job = job
@@ -1576,11 +2338,18 @@ class MainWindow(QMainWindow):
 
     def report_finished(self, output, error: str):
         self.reporting = False
+        report_network_path = getattr(self, "_report_network_path", None)
+        self._network_stop(report_network_path)
         self.dashboard.set_report_generating(False)
         self._report_job = None
         if error:
             self.statusBar().showMessage("PDF report generation failed", 5000)
-            QMessageBox.warning(self, "Unable to generate PDF report", error)
+            if is_network_path(report_network_path):
+                self._offer_network_retry(
+                    "Unable to generate PDF report", error, self.generate_pdf_report
+                )
+            else:
+                QMessageBox.warning(self, "Unable to generate PDF report", error)
             return
 
         output_path = Path(output).resolve()
@@ -1607,13 +2376,9 @@ class MainWindow(QMainWindow):
         if self.scanning:
             self.pending_refresh = True
             return
-        if self.scope_file:
-            try:
-                self.scope_groups = scan_test_scope(self.scope_file)
-            except (OSError, ET.ParseError, UnicodeError) as exc:
-                QMessageBox.warning(self, "Invalid test scope", f"The scope XML could not be read:\n{exc}")
         self.scanning = True
         self.dashboard.start_loading()
+        self._network_start(self.source_path, "Discovering and reading XML results.")
         self.statusBar().showMessage("Reading XML results…")
         job = ScanJob(self.source_path)
         job.signals.progress.connect(self.scan_progress)
@@ -1621,12 +2386,16 @@ class MainWindow(QMainWindow):
         self.pool.start(job)
 
     def scan_progress(self, current: int, total: int, file_name: str, scanned_source):
-        if self.source_path and Path(scanned_source).resolve() == self.source_path.resolve():
+        if self.source_path and normalized_path(Path(scanned_source)) == normalized_path(self.source_path):
             self.dashboard.update_loading(current, total, file_name)
+            if is_network_path(self.source_path):
+                self.network_banner.set_progress(current, total)
 
     def scan_finished(self, records, error, scanned_source):
         self.scanning = False
-        if not self.source_path or Path(scanned_source).resolve() != self.source_path.resolve():
+        scanned_source = normalized_path(Path(scanned_source))
+        self._network_stop(scanned_source)
+        if not self.source_path or scanned_source != normalized_path(self.source_path):
             self.pending_refresh = False
             self.refresh()
             return
@@ -1634,7 +2403,10 @@ class MainWindow(QMainWindow):
         self.pending_refresh = False
         if error:
             self.dashboard.stop_loading()
-            QMessageBox.warning(self, "Unable to read results", error)
+            if is_network_path(scanned_source):
+                self._offer_network_retry("Unable to read results", error, self.refresh)
+            else:
+                QMessageBox.warning(self, "Unable to read results", error)
         else:
             # Commit every valid scan before processing a queued watcher event.
             # This prevents large folders from appearing empty while refreshes race.
@@ -1648,7 +2420,7 @@ class MainWindow(QMainWindow):
             self.refresh_timer.start()
 
     def open_record(self, record: TestRecord):
-        key = str(record.path.resolve())
+        key = str(normalized_path(record.path))
         for index in range(1, self.tabs.count()):
             if self.tabs.widget(index).property("record_path") == key:
                 self.tabs.setCurrentIndex(index); return
@@ -1660,17 +2432,29 @@ class MainWindow(QMainWindow):
             self.tabs.setTabToolTip(index, record.file_name)
             self.tabs.setCurrentIndex(index)
             if key not in self._detail_jobs:
-                job = DetailJob(record.path)
-                self._detail_jobs[key] = job
-                job.signals.finished.connect(self._detail_finished)
-                self.pool.start(job)
+                self._start_detail_job(record.path)
             return
-        page = DetailPage(record); page.setProperty("record_path", key)
+        page = DetailPage(record, self.qa_store, self.qa_pool); page.setProperty("record_path", key)
+        self._connect_detail_page(page)
         label = f"{record.test_id} · {record.title}"
         index = self.tabs.addTab(page, label[:42] + ("…" if len(label) > 42 else ""))
         self.tabs.setTabToolTip(index, record.file_name); self.tabs.setCurrentIndex(index)
 
+    def _start_detail_job(self, path: Path):
+        key = str(normalized_path(path))
+        job = DetailJob(path)
+        self._detail_jobs[key] = job
+        job.signals.finished.connect(self._detail_finished)
+        self._network_start(path, "Loading the selected XML details.")
+        self.pool.start(job)
+
+    def _connect_detail_page(self, page: DetailPage):
+        page.qa_assignment_changed.connect(self._qa_assignment_changed)
+        page.network_operation_started.connect(self._network_start)
+        page.network_operation_finished.connect(self._network_stop)
+
     def _detail_finished(self, record, error: str, record_path: str):
+        self._network_stop(Path(record_path))
         self._detail_jobs.pop(record_path, None)
         tab_index = -1
         for index in range(1, self.tabs.count()):
@@ -1680,9 +2464,16 @@ class MainWindow(QMainWindow):
         if error or record is None:
             if tab_index >= 0 and isinstance(self.tabs.widget(tab_index), DetailLoadingPage):
                 self.tabs.widget(tab_index).show_error(error or "Unknown XML parsing error")
+            if is_network_path(Path(record_path)):
+                self._offer_network_retry(
+                    "Unable to load XML details",
+                    error or "Unknown XML parsing error",
+                    lambda: self._start_detail_job(Path(record_path)),
+                )
             return
         for row, existing in enumerate(self.model.records):
-            if str(existing.path.resolve()) == record_path:
+            if str(normalized_path(existing.path)) == record_path:
+                self.model.hydrate_record(record)
                 self.model.records[row] = record
                 break
         if tab_index < 0:
@@ -1694,7 +2485,8 @@ class MainWindow(QMainWindow):
         tooltip = record.file_name
         self.tabs.removeTab(tab_index)
         old_page.deleteLater()
-        page = DetailPage(record)
+        page = DetailPage(record, self.qa_store, self.qa_pool)
+        self._connect_detail_page(page)
         page.setProperty("record_path", record_path)
         self.tabs.insertTab(tab_index, page, tab_text)
         self.tabs.setTabToolTip(tab_index, tooltip)
@@ -1702,6 +2494,17 @@ class MainWindow(QMainWindow):
             self.tabs.setCurrentIndex(tab_index)
         elif current_widget is not None:
             self.tabs.setCurrentWidget(current_widget)
+
+    def _qa_assignment_changed(self, record: TestRecord):
+        for row, existing in enumerate(self.model.records):
+            if normalized_path(existing.path) == normalized_path(record.path):
+                self.model.records[row].qa_member_id = record.qa_member_id
+                self.model.records[row].qa_member_name = record.qa_member_name
+                self.model.records[row].qa_comment = record.qa_comment
+                first = self.model.index(row, ResultsModel.QA_COLUMN)
+                last = self.model.index(row, ResultsModel.QA_COMMENT_COLUMN)
+                self.model.dataChanged.emit(first, last, [Qt.DisplayRole, Qt.EditRole])
+                break
 
     def close_tab(self, index: int):
         if index == 0: return
@@ -1735,12 +2538,19 @@ QFrame#panel, QFrame#statCard { background: #FFFFFF; border: 1px solid #E3E8F0; 
 QFrame#clusterCard { background: transparent; border: 0; }
 QFrame#overallPanel { background: #F7F9FC; border: 1px solid #E3E8F0; border-radius: 8px; }
 QFrame#loadingPanel { background: #F0EDFF; border: 1px solid #CFC7F2; border-radius: 8px; }
+QFrame#networkBanner { background: #FFF7E8; border: 0; border-bottom: 1px solid #EBCB8B; }
+QLabel#networkBannerTag { background: #D38A16; color: white; border-radius: 4px; padding: 3px 7px; font-size: 9px; font-weight: 800; }
+QLabel#networkBannerText { color: #77500F; font-size: 11px; font-weight: 700; }
+QProgressBar#networkBannerProgress { background: #F0DFC0; border: 0; border-radius: 4px; }
+QProgressBar#networkBannerProgress::chunk { background: #D38A16; border-radius: 4px; }
 QFrame#statCard:hover { border: 1px solid #AFC6F3; background: #FBFDFF; }
 QLabel#pageTitle { color: #16213A; font-size: 21px; font-weight: 700; }
 QLabel#sectionTitle { color: #17233C; font-size: 16px; font-weight: 700; }
 QLabel#eyebrow { color: #3974D8; font-size: 10px; font-weight: 800; letter-spacing: 1px; }
 QLabel#brand { background: transparent; padding: 0; }
 QLabel#muted { color: #718096; }
+QLabel#editableDetailValue { color: #24324A; border-bottom: 1px dotted #A8B7CC; padding: 2px 3px; }
+QLabel#editableDetailValue:hover { color: #285FBF; background: #EAF1FC; border-radius: 4px; }
 QLabel#statValue { color: #17233C; font-size: 21px; font-weight: 750; }
 QLabel#loadingLabel { color: #3E328A; font-size: 11px; font-weight: 750; min-width: 175px; }
 QLabel#hint { background: #EEF4FF; color: #536A91; border-radius: 8px; padding: 12px; }
@@ -1768,6 +2578,17 @@ QPushButton#secondaryButton { background: #EAF1FC; color: #2E63BD; }
 QPushButton#reportButton { background: #4F9A7D; color: white; }
 QPushButton#reportButton:hover { background: #43866D; }
 QPushButton#reportButton:disabled { background: #A9CDBF; color: #F3FAF7; }
+QPushButton#detailEditButton { background: #EAF1FC; color: #285FBF; border: 1px solid #C9D9F3; padding: 7px 12px; }
+QPushButton#detailEditButton:hover { background: #DDEAFF; border-color: #9DBBEA; }
+QPushButton#detailSaveButton { background: #4F9A7D; color: white; border: 1px solid #43866D; padding: 7px 12px; }
+QPushButton#detailSaveButton:hover { background: #43866D; }
+QPushButton#detailCancelButton { background: #F1F3F6; color: #68758A; border: 1px solid #D9DFE8; padding: 7px 12px; }
+QPushButton#detailCancelButton:hover { background: #E6E9EE; color: #475569; }
+QPushButton#detailAddButton { background: #F3EEFF; color: #6246B5; border: 1px solid #D8CEF5; padding: 7px 12px; }
+QPushButton#detailAddButton:hover { background: #E9E0FF; border-color: #BEAFE9; }
+QPushButton#detailRemoveButton { background: #FCEFF1; color: #B3384C; border: 1px solid #F0C5CC; padding: 7px 12px; }
+QPushButton#detailRemoveButton:hover { background: #F9DDE2; border-color: #E8A7B2; }
+QPushButton#detailRemoveButton:disabled { background: #F4F5F7; color: #A5ADBA; border-color: #E2E5EA; }
 QPushButton#clearScopeButton { background: #F1F3F6; color: #68758A; border: 1px solid #D9DFE8; }
 QPushButton#clearScopeButton:hover { background: #FBE4E7; color: #A72F43; border: 1px solid #EDB9C1; }
 QPushButton#pathToggle { background: transparent; color: #3E63A8; border: 0; padding: 3px 5px; font-size: 10px; font-weight: 700; }
