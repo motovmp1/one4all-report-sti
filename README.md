@@ -2,7 +2,7 @@
 
 A PySide6 desktop application for reviewing One4All XML test results.
 
-Branded as **TRIDONIC — WE MANAGE LIGHT**, Version 1.2, powered by PT Team.
+Branded as **TRIDONIC — WE MANAGE LIGHT**, Version 1.3, powered by PT Team.
 
 ## Tools used and tested
 
@@ -20,7 +20,7 @@ final Setup `.exe` do not need Python, pip, PySide6, PyInstaller, or Inno Setup.
 
 ### Changes made on the current build computer
 
-During creation of the Version 1.2 installer:
+During creation of the Version 1.3 installer:
 
 - the existing Python 3.14.6 and project `.venv` were used;
 - PyInstaller 6.21.0 and its build dependencies were installed inside `.venv`
@@ -96,7 +96,7 @@ the `test_scope.xml` file next to `main.py` when available.
 Share this file with users who do not have Python installed:
 
 ```text
-release\Tridonic-One4All-Viewer-Setup-1.2.exe
+release\Tridonic-One4All-Viewer-Setup-1.3.exe
 ```
 
 The installer contains Python, PySide6, and all runtime dependencies. It installs
@@ -127,14 +127,14 @@ The build script performs these steps automatically:
 The finished installer is written to:
 
 ```text
-release\Tridonic-One4All-Viewer-Setup-1.2.exe
+release\Tridonic-One4All-Viewer-Setup-1.3.exe
 ```
 
 Confirm that it exists and calculate its checksum with:
 
 ```powershell
-Get-Item .\release\Tridonic-One4All-Viewer-Setup-1.2.exe
-Get-FileHash .\release\Tridonic-One4All-Viewer-Setup-1.2.exe -Algorithm SHA256
+Get-Item .\release\Tridonic-One4All-Viewer-Setup-1.3.exe
+Get-FileHash .\release\Tridonic-One4All-Viewer-Setup-1.3.exe -Algorithm SHA256
 ```
 
 To change the public version number, update it consistently in:
@@ -167,7 +167,8 @@ installer; no manual PyInstaller or Inno Setup command is required.
   while complete step details are parsed in the background only when opened;
 - completed scans remain visible when filesystem changes queue another refresh;
 - Passed, Failed, Skipped, Aborted, Draft, and Unknown states;
-- search and status filters;
+- combined search, status, and dynamic Function Block number filters;
+- Function Block choices are generated only from the result IDs currently loaded;
 - static, aligned **QA member** and **QA comment** columns in the overview table;
 - QA members and task assignments live in `One4All_QA_data.xml`, beside the
   selected `test_scope.xml`;

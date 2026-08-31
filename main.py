@@ -22,6 +22,7 @@ from PySide6.QtCore import (
     QSize,
     QSortFilterProxyModel,
     QPropertyAnimation,
+    QSignalBlocker,
     Qt,
     QThreadPool,
     QTimer,
@@ -902,6 +903,7 @@ class ResultsProxy(QSortFilterProxyModel):
         super().__init__()
         self.query = ""
         self.status = "all"
+        self.function_block = "all"
 
     def set_query(self, value: str):
         self.beginFilterChange()
@@ -913,15 +915,23 @@ class ResultsProxy(QSortFilterProxyModel):
         self.status = value
         self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
 
+    def set_function_block(self, value: str):
+        self.beginFilterChange()
+        self.function_block = value
+        self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
+
     def filterAcceptsRow(self, source_row, source_parent):
         model: ResultsModel = self.sourceModel()
         record = model.records[source_row]
         status_ok = self.status == "all" or record.status == self.status
+        function_block_ok = (
+            self.function_block == "all" or record.family == self.function_block
+        )
         text = (
             f"{record.test_id} {record.title} {record.file_name} {record.dut} "
             f"{record.tester} {record.qa_member_name} {record.qa_comment}"
         ).casefold()
-        return status_ok and (not self.query or self.query in text)
+        return status_ok and function_block_ok and (not self.query or self.query in text)
 
 
 class StepsModel(QAbstractTableModel):
@@ -1897,11 +1907,14 @@ class Dashboard(QWidget):
         tp = QVBoxLayout(table_panel); tp.setContentsMargins(12, 10, 12, 10); tp.setSpacing(8)
         controls = QHBoxLayout()
         self.search = QLineEdit(); self.search.setPlaceholderText("Search by ID, name, DUT, or tester…"); self.search.setClearButtonEnabled(True)
-        self.status_filter = QComboBox(); self.status_filter.addItem("All statuses", "all")
+        self.status_filter = QComboBox(); self.status_filter.addItem("Filter by status", "all")
         for status, data in STATUS_META.items(): self.status_filter.addItem(data[0], status)
+        self.status_filter.setToolTip("Filter the loaded results by test status")
+        self.number_filter = QComboBox(); self.number_filter.addItem("Filter by number", "all")
+        self.number_filter.setToolTip("Filter by Function Block number found in the loaded results")
         self.filter_badge = QPushButton("●  FILTER ACTIVE — CLEAR")
         self.filter_badge.setObjectName("activeFilterBadge")
-        self.filter_badge.setToolTip("A search or status filter is active. Click to clear all filters.")
+        self.filter_badge.setToolTip("A search, status, or Function Block filter is active. Click to clear all filters.")
         self.filter_badge.clicked.connect(self._clear_filters)
         self.filter_badge.hide()
         self.filter_opacity = QGraphicsOpacityEffect(self.filter_badge)
@@ -1915,9 +1928,11 @@ class Dashboard(QWidget):
         self.filter_animation.setKeyValueAt(1.0, 1.0)
         self.search.textChanged.connect(self._filters_changed)
         self.status_filter.currentIndexChanged.connect(self._filters_changed)
+        self.number_filter.currentIndexChanged.connect(self._filters_changed)
         self.visible_label = QLabel("0 results"); self.visible_label.setObjectName("muted")
         controls.addWidget(self.search, 1)
         controls.addWidget(self.status_filter)
+        controls.addWidget(self.number_filter)
         controls.addWidget(self.filter_badge)
         controls.addWidget(self.visible_label)
         tp.addLayout(controls)
@@ -2054,7 +2069,12 @@ class Dashboard(QWidget):
     def _filters_changed(self, *args):
         self.proxy.set_query(self.search.text())
         self.proxy.set_status(self.status_filter.currentData())
-        active = bool(self.search.text().strip()) or self.status_filter.currentData() != "all"
+        self.proxy.set_function_block(self.number_filter.currentData())
+        active = (
+            bool(self.search.text().strip())
+            or self.status_filter.currentData() != "all"
+            or self.number_filter.currentData() != "all"
+        )
         self.filter_badge.setVisible(active)
         if active and self.filter_animation.state() != QAbstractAnimation.Running:
             self.filter_animation.start()
@@ -2065,6 +2085,24 @@ class Dashboard(QWidget):
     def _clear_filters(self):
         self.search.clear()
         self.status_filter.setCurrentIndex(0)
+        self.number_filter.setCurrentIndex(0)
+        self._filters_changed()
+
+    def _update_number_filter(self, records: list[TestRecord]):
+        """Build the Function Block choices only from the currently loaded results."""
+        selected = self.number_filter.currentData()
+        families = sorted(
+            {record.family for record in records if record.family.isdigit()},
+            key=int,
+        )
+        blocker = QSignalBlocker(self.number_filter)
+        self.number_filter.clear()
+        self.number_filter.addItem("Filter by number", "all")
+        for family in families:
+            self.number_filter.addItem(f"FB {family}", family)
+        selected_index = self.number_filter.findData(selected)
+        self.number_filter.setCurrentIndex(selected_index if selected_index >= 0 else 0)
+        del blocker
         self._filters_changed()
 
     def start_loading(self, message: str = "Discovering XML results…"):
@@ -2119,6 +2157,7 @@ class Dashboard(QWidget):
         scope_file: Path | None = None,
         scope_groups: list[ScopeGroup] | None = None,
     ):
+        self._update_number_filter(records)
         if folder:
             source_kind = "Single XML" if folder.is_file() else "Results folder"
             self.folder_label.setText(f"{source_kind}: {folder}")
@@ -2212,7 +2251,7 @@ class Dashboard(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Tridonic One4All Viewer — Version 1.2")
+        self.setWindowTitle("Tridonic One4All Viewer — Version 1.3")
         self.resize(1440, 900); self.setMinimumSize(1200, 760)
         self.qa_store = QAMemberStore()
         self.model = ResultsModel(self.qa_store); self.proxy = ResultsProxy(); self.proxy.setSourceModel(self.model)
@@ -2251,7 +2290,7 @@ class MainWindow(QMainWindow):
         self._scope_job: ScopeLoadJob | None = None
         self._scope_job_silent = False
         self._network_activity_count = 0
-        version_label = QLabel("VERSION 1.2")
+        version_label = QLabel("VERSION 1.3")
         version_label.setObjectName("footerMeta")
         powered_label = QLabel("POWERED BY PT TEAM")
         powered_label.setObjectName("footerBrand")
@@ -2773,6 +2812,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Tridonic One4All Viewer")
     app.setApplicationDisplayName("Tridonic One4All Viewer")
+    app.setApplicationVersion("1.3")
     icon_path = APP_DIR / "app_icon.ico"
     if icon_path.is_file():
         app.setWindowIcon(QIcon(str(icon_path)))

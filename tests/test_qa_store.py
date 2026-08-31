@@ -14,12 +14,15 @@ from PySide6.QtCore import QThreadPool
 
 from generate_meeting_pdf import load_qa_member_names
 from main import (
+    Dashboard,
     DetailPage,
     MainWindow,
     NetworkBanner,
     QAAssignment,
     QAMemberStore,
     ReportJob,
+    ResultsModel,
+    ResultsProxy,
     ScopeLoadJob,
     TestRecord,
     is_network_path,
@@ -350,6 +353,70 @@ class QAMemberStoreTests(unittest.TestCase):
         self.assertTrue(window.dashboard.choose_scope_button.isEnabled())
         self.assertGreater(len(window.model.records), 0)
         window.close()
+
+    def test_dynamic_function_block_filter_combines_with_status_and_search(self):
+        store = QAMemberStore()
+        store.set_data_file(self.data_file)
+        model = ResultsModel(store)
+        proxy = ResultsProxy()
+        proxy.setSourceModel(model)
+        records = [
+            TestRecord(
+                path=self.folder / "9.1 CLO - passed.xml",
+                file_name="9.1 CLO - passed.xml",
+                title="CLO function disabled",
+                test_id="9.1",
+                family="9",
+                status="passed",
+                is_draft=False,
+                started=None,
+                stopped=None,
+                duration_seconds=None,
+            ),
+            TestRecord(
+                path=self.folder / "21.2 Thermal protection - failed.xml",
+                file_name="21.2 Thermal protection - failed.xml",
+                title="Thermal protection",
+                test_id="21.2",
+                family="21",
+                status="failed",
+                is_draft=False,
+                started=None,
+                stopped=None,
+                duration_seconds=None,
+            ),
+            TestRecord(
+                path=self.folder / "21.3 Overtemperature - passed.xml",
+                file_name="21.3 Overtemperature - passed.xml",
+                title="Overtemperature recovery",
+                test_id="21.3",
+                family="21",
+                status="passed",
+                is_draft=False,
+                started=None,
+                stopped=None,
+                duration_seconds=None,
+            ),
+        ]
+        model.set_records(records)
+        dashboard = Dashboard(model, proxy)
+        dashboard.update_data(self.folder, records)
+
+        self.assertEqual(
+            [dashboard.number_filter.itemText(index) for index in range(dashboard.number_filter.count())],
+            ["Filter by number", "FB 9", "FB 21"],
+        )
+        dashboard.number_filter.setCurrentIndex(dashboard.number_filter.findData("21"))
+        self.assertEqual(proxy.rowCount(), 2)
+        dashboard.status_filter.setCurrentIndex(dashboard.status_filter.findData("failed"))
+        self.assertEqual(proxy.rowCount(), 1)
+        dashboard.search.setText("thermal")
+        self.assertEqual(proxy.rowCount(), 1)
+        dashboard.search.setText("recovery")
+        self.assertEqual(proxy.rowCount(), 0)
+        dashboard._clear_filters()
+        self.assertEqual(proxy.rowCount(), 3)
+        dashboard.deleteLater()
 
 
 if __name__ == "__main__":
