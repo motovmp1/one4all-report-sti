@@ -14,6 +14,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from reportlab.lib.colors import Color, HexColor, white
 from reportlab.lib.pagesizes import landscape
@@ -41,6 +42,7 @@ PALE_GREEN = HexColor("#EDF8F3")
 PALE_RED = HexColor("#FCEFF1")
 PALE_AMBER = HexColor("#FFF6E7")
 QA_DATA_FILE_NAME = "One4All_QA_data.xml"
+ProgressCallback = Callable[[int, str], None]
 
 
 @dataclass
@@ -228,8 +230,27 @@ def next_available_path(path: Path) -> Path:
         sequence += 1
 
 
-def collect(results_dir: Path, scope_ids: set[str]):
-    all_results = [r for p in results_dir.rglob("*.xml") if (r := parse_result(p))]
+def collect(
+    results_dir: Path,
+    scope_ids: set[str],
+    progress_callback: ProgressCallback | None = None,
+):
+    if progress_callback:
+        progress_callback(8, "Discovering XML result files")
+    paths = list(results_dir.rglob("*.xml"))
+    total = len(paths)
+    if progress_callback:
+        progress_callback(10, f"Found {total} XML result files")
+    all_results = []
+    last_percent = 10
+    for current, path in enumerate(paths, 1):
+        result = parse_result(path)
+        if result:
+            all_results.append(result)
+        percent = 10 + round(current * 70 / max(1, total))
+        if progress_callback and percent != last_percent:
+            progress_callback(percent, f"Reading XML results — {current}/{total}")
+            last_percent = percent
     latest: dict[str, Result] = {}
     for result in all_results:
         previous = latest.get(result.test_id)
@@ -733,8 +754,17 @@ def draw_traceability(c, args, report_date, scoped, results, evidence, qa_member
     c.showPage()
 
 
-def generate(args: argparse.Namespace) -> Path:
+def generate(
+    args: argparse.Namespace,
+    progress_callback: ProgressCallback | None = None,
+) -> Path:
+    def report_progress(percent: int, message: str):
+        if progress_callback:
+            progress_callback(percent, message)
+
+    report_progress(1, "Starting report generation")
     report_date = datetime.strptime(args.date, "%Y-%m-%d") if args.date else datetime.now()
+    report_progress(3, "Reading campaign information")
     campaign_info = load_campaign_info(args.scope)
     args.project = args.project or campaign_info.get("ProjectName") or "Test campaign"
     if args.output is None:
@@ -748,26 +778,37 @@ def generate(args: argparse.Namespace) -> Path:
             f"{generated_date}_week_{iso_week:02d}.pdf"
         )
         args.output = next_available_path(args.output)
+    report_progress(5, "Reading test scope")
     scope_ids, labels = load_scope(args.scope)
     if not scope_ids:
         raise ValueError("The selected test scope does not contain any active tests.")
-    all_results, latest, scoped = collect(args.results, scope_ids)
+    all_results, latest, scoped = collect(args.results, scope_ids, progress_callback)
     if not all_results:
         raise ValueError("No valid One4All XML result files were found in the selected folder.")
+    report_progress(82, "Analyzing the latest test results")
     rows = family_rows(scope_ids, scoped, labels)
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    report_progress(84, "Preparing PDF pages")
     c = canvas.Canvas(str(args.output), pagesize=PAGE, pageCompression=1)
     c.setTitle(safe_text(f"{args.project} - {args.round_name} Test Report"))
     c.setAuthor("PT Team")
     evidence = evidence_values(scoped)
     qa_members = load_qa_member_names(args.scope, scoped)
+    report_progress(86, "Creating report cover")
     draw_cover(c, args, report_date, scoped, all_results, evidence, campaign_info)
+    report_progress(88, "Creating configuration page")
     draw_traceability(c, args, report_date, scoped, all_results, evidence, qa_members)
+    report_progress(91, "Creating summary page")
     draw_summary(c, args, report_date, scope_ids, scoped, all_results)
+    report_progress(94, "Creating coverage pages")
     draw_coverage(c, args, report_date, rows)
+    report_progress(96, "Creating failure pages")
     failure_pages = draw_failures(c, args, report_date, scoped, rows)
+    report_progress(98, "Creating open-scope page")
     draw_gaps(c, args, report_date, scope_ids, scoped, rows, 5 + failure_pages)
+    report_progress(99, "Saving PDF file")
     c.save()
+    report_progress(100, "Report complete")
     return args.output
 
 
@@ -778,6 +819,7 @@ def generate_report_pdf(
     project: str | None = None,
     round_name: str = "Pre-release",
     report_date: str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> Path:
     """Generate a report from the paths selected in the One4All Viewer UI."""
     options = argparse.Namespace(
@@ -789,7 +831,7 @@ def generate_report_pdf(
         output=None,
         output_dir=Path(output_dir),
     )
-    return generate(options)
+    return generate(options, progress_callback)
 
 
 if __name__ == "__main__":

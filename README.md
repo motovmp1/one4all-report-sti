@@ -169,10 +169,11 @@ installer; no manual PyInstaller or Inno Setup command is required.
 - Passed, Failed, Skipped, Aborted, Draft, and Unknown states;
 - search and status filters;
 - static, aligned **QA member** and **QA comment** columns in the overview table;
-- QA members, task assignments, and **QA comments** live only in
-  `One4All_QA_data.xml`, beside the selected `test_scope.xml`;
-- the QA XML is created only when a user first adds a member or saves QA data;
-  `Test_report_data.xml` is legacy data and is never read or modified by this feature;
+- QA members and task assignments live in `One4All_QA_data.xml`, beside the
+  selected `test_scope.xml`;
+- the QA XML is created only when a user first adds a member or assigns QA data;
+- QA comments are read from and saved to the existing `Test_report_data.xml`
+  beside the selected scope, keeping the Viewer and legacy application synchronized;
 - result-step comments remain only in the detailed Steps table and are never
   copied into the initial overview;
 - inside a test's detail **Overview**, QA member and QA comment each have their own

@@ -1,10 +1,11 @@
-import hashlib
 import os
 import shutil
 import time
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -18,6 +19,7 @@ from main import (
     NetworkBanner,
     QAAssignment,
     QAMemberStore,
+    ReportJob,
     ScopeLoadJob,
     TestRecord,
     is_network_path,
@@ -35,26 +37,30 @@ class QAMemberStoreTests(unittest.TestCase):
         self.data_file = self.folder / "One4All_QA_data.xml"
         self.result = self.folder / "30.4 result.xml"
         self.legacy_file = self.folder / "Test_report_data.xml"
-        self.legacy_file.write_bytes(b'<Tests legacy="yes"/>')
-        self.legacy_hash = hashlib.sha256(self.legacy_file.read_bytes()).digest()
+        self.legacy_file.write_text(
+            '<Tests legacy="yes"><Test Number="30.4" Duration="0" BugIDs="" '
+            'BugIDsFI="" DID="" Tester="" Comment="legacy comment">'
+            '<Index>0</Index><Name>30.4 result.xml</Name></Test></Tests>',
+            encoding="utf-8",
+        )
 
     def tearDown(self):
         shutil.rmtree(self.folder)
 
-    def test_scope_data_is_lazy_and_does_not_touch_legacy_file(self):
+    def test_adding_a_qa_member_does_not_touch_legacy_comments(self):
         store = QAMemberStore()
         self.assertEqual(store.members, [])
         store.set_data_file(self.data_file)
         self.assertFalse(self.data_file.exists())
+        legacy_before = self.legacy_file.read_bytes()
 
         member = store.add_member("Alice QA")
         self.assertEqual(member.member_id, "QA001")
         self.assertTrue(self.data_file.exists())
-        self.assertEqual(
-            hashlib.sha256(self.legacy_file.read_bytes()).digest(), self.legacy_hash
-        )
+        self.assertEqual(self.legacy_file.read_bytes(), legacy_before)
+        self.assertEqual(store.assignment_for(self.result).qa_comment, "legacy comment")
 
-    def test_member_and_comment_are_saved_independently(self):
+    def test_member_is_saved_in_qa_xml_and_comment_in_legacy_xml(self):
         store = QAMemberStore()
         store.set_data_file(self.data_file)
         member = store.add_member("Alice QA")
@@ -76,8 +82,37 @@ class QAMemberStoreTests(unittest.TestCase):
         self.assertEqual(
             reloaded.assignment_for(self.result), QAAssignment("QA001", "changed comment")
         )
+        legacy_test = ET.parse(self.legacy_file).getroot().find("./Test")
+        self.assertEqual(legacy_test.get("Comment"), "changed comment")
+        qa_test = ET.parse(self.data_file).getroot().find("./Tests/Test")
+        self.assertIsNone(qa_test.find("Comment"))
+
+    def test_comment_entry_is_created_dynamically_when_result_is_missing(self):
+        other_result = self.folder / "31.2 new result.xml"
+        store = QAMemberStore()
+        store.set_data_file(self.data_file)
+
+        store.assign_comment(other_result, "new shared comment")
+
+        tests = ET.parse(self.legacy_file).getroot().findall("./Test")
+        created = next(item for item in tests if item.findtext("Name") == other_result.name)
+        self.assertEqual(created.get("Number"), "31.2")
+        self.assertEqual(created.get("Comment"), "new shared comment")
+        self.assertEqual(store.assignment_for(other_result).qa_comment, "new shared comment")
+
+    def test_unique_legacy_number_matches_an_abbreviated_name(self):
+        self.legacy_file.write_text(
+            '<Tests><Test Number="30.4" Comment="shared abbreviated comment">'
+            '<Index>0</Index><Name>30.4 abbreviated legacy name</Name>'
+            '</Test></Tests>',
+            encoding="utf-8",
+        )
+        store = QAMemberStore()
+        store.set_data_file(self.data_file)
+
         self.assertEqual(
-            hashlib.sha256(self.legacy_file.read_bytes()).digest(), self.legacy_hash
+            store.assignment_for(self.result).qa_comment,
+            "shared abbreviated comment",
         )
 
     def test_clearing_scope_clears_loaded_qa_data(self):
@@ -122,6 +157,8 @@ class QAMemberStoreTests(unittest.TestCase):
         page._start_comment_edit()
         self.assertTrue(page.qa_combo.isHidden())
         self.assertFalse(page.comments_editor.isHidden())
+        self.assertEqual(page.comments_editor.minimumWidth(), 900)
+        self.assertEqual(page.comments_editor.maximumWidth(), 900)
         page.comments_editor.setPlainText("discarded comment")
         page._cancel_comment_edit()
         self.assertEqual(record.qa_comment, "saved comment")
@@ -257,6 +294,30 @@ class QAMemberStoreTests(unittest.TestCase):
         self.assertIsNone(page._qa_job)
         self.assertEqual(store.assignment_for(self.result).qa_comment, "network-safe comment")
 
+    def test_report_job_forwards_real_generation_progress(self):
+        progress = []
+        finished = []
+        output = self.folder / "report.pdf"
+
+        def generate_with_progress(results, scope, output_dir, progress_callback):
+            progress_callback(10, "Found 12 XML result files")
+            progress_callback(55, "Reading XML results — 8/12")
+            progress_callback(100, "Report complete")
+            return output
+
+        with patch("main.generate_report_pdf", side_effect=generate_with_progress):
+            job = ReportJob(self.folder, self.folder / "scope.xml", self.folder)
+            job.signals.progress.connect(
+                lambda percent, message: progress.append((percent, message))
+            )
+            job.signals.finished.connect(
+                lambda result, error: finished.append((result, error))
+            )
+            job.run()
+
+        self.assertEqual([percent for percent, _message in progress], [10, 55, 100])
+        self.assertEqual(finished, [(output, "")])
+
     def test_main_window_loads_scope_and_results_without_blocking(self):
         scope = self.folder / "test_scope.xml"
         scope.write_text(
@@ -277,11 +338,16 @@ class QAMemberStoreTests(unittest.TestCase):
 
         results = Path(__file__).parents[1] / "ST-I_Results"
         window.set_folder(results)
+        self.assertTrue(window.scanning)
+        self.assertFalse(window.dashboard.choose_scope_button.isEnabled())
+        window.set_scope_file(scope)
+        self.assertIsNone(window._scope_job)
         deadline = time.monotonic() + 10
         while window.scanning and time.monotonic() < deadline:
             self.app.processEvents()
             time.sleep(0.01)
         self.assertFalse(window.scanning)
+        self.assertTrue(window.dashboard.choose_scope_button.isEnabled())
         self.assertGreater(len(window.model.records), 0)
         window.close()
 

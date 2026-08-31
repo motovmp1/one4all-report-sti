@@ -76,6 +76,7 @@ APP_DIR = (
     else Path(__file__).resolve().parent
 )
 QA_DATA_FILE_NAME = "One4All_QA_data.xml"
+LEGACY_REPORT_DATA_FILE_NAME = "Test_report_data.xml"
 
 
 def normalized_path(path: Path) -> Path:
@@ -122,12 +123,13 @@ class QAAssignment:
 
 
 class QAMemberStore:
-    """Scope-local QA members, assignments and comments in an app-owned XML."""
+    """QA members in app-owned XML and comments in the shared legacy XML."""
 
     def __init__(self):
         self.members: list[QAMember] = []
         self.assignments: dict[str, QAAssignment] = {}
         self.data_file: Path | None = None
+        self.comment_data_file: Path | None = None
         self.warning = ""
 
     def reload(self):
@@ -135,7 +137,30 @@ class QAMemberStore:
         self.assignments = {}
         self.warning = ""
         path = self.data_file
-        if not path or not path.is_file():
+        if not path:
+            return
+        legacy_comments: dict[str, str] = {}
+        legacy_by_number: dict[str, list[str]] = {}
+        legacy_path = self.comment_data_file
+        if legacy_path and legacy_path.is_file():
+            try:
+                legacy_root = ET.parse(legacy_path).getroot()
+                for element in legacy_root.findall("./Test"):
+                    result_name = (element.findtext("Name", default="") or "").strip()
+                    if result_name:
+                        comment = (element.get("Comment") or "").strip()
+                        legacy_comments[result_name.casefold()] = comment
+                        number = (element.get("Number") or "").strip().casefold()
+                        if number:
+                            legacy_by_number.setdefault(number, []).append(comment)
+            except (OSError, ET.ParseError) as exc:
+                self.warning = f"{LEGACY_REPORT_DATA_FILE_NAME} could not be read: {exc}"
+        if not path.is_file():
+            for result_name, comment in legacy_comments.items():
+                self.assignments[result_name] = QAAssignment("", comment)
+            for number, comments in legacy_by_number.items():
+                if len(comments) == 1:
+                    self.assignments[f"@test:{number}"] = QAAssignment("", comments[0])
             return
         try:
             root = ET.parse(path).getroot()
@@ -149,14 +174,31 @@ class QAMemberStore:
             for element in root.findall("./Tests/Test"):
                 result_name = (element.get("result") or "").strip()
                 member_id = (element.get("qaMemberId") or "").strip()
-                comment = element.findtext("Comment", default="").strip()
+                # Preserve comments written by versions 1.1/1.2 only as a
+                # fallback. Test_report_data.xml is now authoritative.
+                old_comment = element.findtext("Comment", default="").strip()
+                comment = legacy_comments.pop(result_name.casefold(), old_comment)
                 if result_name:
                     self.assignments[result_name.casefold()] = QAAssignment(member_id, comment)
+            for result_name, comment in legacy_comments.items():
+                current = self.assignments.get(result_name, QAAssignment())
+                self.assignments[result_name] = QAAssignment(current.member_id, comment)
+            for number, comments in legacy_by_number.items():
+                if len(comments) == 1:
+                    self.assignments[f"@test:{number}"] = QAAssignment("", comments[0])
         except (OSError, ET.ParseError) as exc:
-            self.warning = f"{QA_DATA_FILE_NAME} could not be read: {exc}"
+            qa_warning = f"{QA_DATA_FILE_NAME} could not be read: {exc}"
+            self.warning = f"{self.warning} {qa_warning}".strip()
 
-    def set_data_file(self, path: Path | None):
+    def set_data_file(self, path: Path | None, comment_path: Path | None = None):
         self.data_file = normalized_path(path) if path else None
+        self.comment_data_file = (
+            normalized_path(comment_path)
+            if comment_path
+            else self.data_file.parent / LEGACY_REPORT_DATA_FILE_NAME
+            if self.data_file
+            else None
+        )
         self.reload()
 
     def set_loaded_data(
@@ -167,6 +209,9 @@ class QAMemberStore:
         warning: str = "",
     ):
         self.data_file = normalized_path(path) if path else None
+        self.comment_data_file = (
+            self.data_file.parent / LEGACY_REPORT_DATA_FILE_NAME if self.data_file else None
+        )
         self.members = members
         self.assignments = assignments
         self.warning = warning
@@ -230,7 +275,16 @@ class QAMemberStore:
         return next((member for member in self.members if member.member_id.casefold() == wanted), None)
 
     def assignment_for(self, path: Path) -> QAAssignment:
-        return self.assignments.get(path.name.casefold(), QAAssignment())
+        exact = self.assignments.get(path.name.casefold(), QAAssignment())
+        if exact.qa_comment:
+            return exact
+        test_id_match = re.match(r"(\d+(?:\.\d+)*)", path.name)
+        if not test_id_match:
+            return exact
+        fallback = self.assignments.get(
+            f"@test:{test_id_match.group(1).casefold()}", QAAssignment()
+        )
+        return QAAssignment(exact.member_id, fallback.qa_comment)
 
     def resolved_member(self, path: Path) -> QAMember | None:
         return self.member_by_id(self.assignment_for(path).member_id)
@@ -250,13 +304,74 @@ class QAMemberStore:
         self._write_tree(tree)
 
     def assign_comment(self, path: Path, qa_comment: str):
-        tree, root = self._load_or_create_tree()
-        element = self._assignment_element(root, path)
-        comment = element.find("Comment")
-        if comment is None:
-            comment = ET.SubElement(element, "Comment")
-        comment.text = qa_comment.strip()
-        self._write_tree(tree)
+        legacy_path = self.comment_data_file
+        if legacy_path is None:
+            raise OSError("Select the matching test_scope.xml before saving a QA comment.")
+        if legacy_path.is_file():
+            try:
+                tree = ET.parse(legacy_path)
+            except ET.ParseError as exc:
+                raise OSError(
+                    f"{LEGACY_REPORT_DATA_FILE_NAME} is not valid XML: {exc}"
+                ) from exc
+            root = tree.getroot()
+            if root.tag != "Tests":
+                raise OSError(
+                    f"{LEGACY_REPORT_DATA_FILE_NAME} has an unsupported root element."
+                )
+        else:
+            root = ET.Element("Tests")
+            tree = ET.ElementTree(root)
+
+        wanted = path.name.casefold()
+        element = next(
+            (
+                item
+                for item in root.findall("./Test")
+                if (item.findtext("Name", default="") or "").strip().casefold() == wanted
+            ),
+            None,
+        )
+        if element is None:
+            test_id_match = re.match(r"(\d+(?:\.\d+)*)", path.name)
+            test_id = test_id_match.group(1) if test_id_match else ""
+            same_number = [
+                item
+                for item in root.findall("./Test")
+                if (item.get("Number") or "").strip().casefold() == test_id.casefold()
+            ]
+            # A unique test number is a safe fallback when the legacy Name is
+            # an older/short form. Multiple temperature variants are not.
+            element = same_number[0] if len(same_number) == 1 else None
+        if element is None:
+            indices = []
+            for item in root.findall("./Test/Index"):
+                try:
+                    indices.append(int((item.text or "").strip()))
+                except ValueError:
+                    pass
+            test_id_match = re.match(r"(\d+(?:\.\d+)*)", path.name)
+            element = ET.SubElement(
+                root,
+                "Test",
+                Number=test_id_match.group(1) if test_id_match else "",
+                Duration="0",
+                BugIDs="",
+                BugIDsFI="",
+                DID="",
+                Tester="",
+                Comment="",
+            )
+            ET.SubElement(element, "Index").text = str(max(indices, default=-1) + 1)
+            ET.SubElement(element, "Name").text = path.name
+
+        element.set("Comment", qa_comment.strip())
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        ET.indent(tree, space="  ")
+        temporary = legacy_path.with_suffix(legacy_path.suffix + ".tmp")
+        tree.write(temporary, encoding="utf-8", xml_declaration=True)
+        temporary.replace(legacy_path)
+        self.reload()
 
 
 def copy_path_icon() -> QIcon:
@@ -594,6 +709,7 @@ class DetailJob(QRunnable):
 
 class ReportSignals(QObject):
     finished = Signal(object, str)
+    progress = Signal(int, str)
 
 
 class ReportJob(QRunnable):
@@ -606,7 +722,12 @@ class ReportJob(QRunnable):
 
     def run(self):
         try:
-            output = generate_report_pdf(self.results, self.scope, self.output_dir)
+            output = generate_report_pdf(
+                self.results,
+                self.scope,
+                self.output_dir,
+                progress_callback=self.signals.progress.emit,
+            )
             error = ""
         except Exception as exc:
             output, error = None, str(exc)
@@ -1185,7 +1306,7 @@ class DetailPage(QWidget):
         self.comments_value.setMaximumWidth(900)
         self.comments_editor = QPlainTextEdit()
         self.comments_editor.setMaximumHeight(115)
-        self.comments_editor.setMaximumWidth(900)
+        self.comments_editor.setFixedWidth(900)
         self.comments_editor.hide()
         self.comment_edit_button = QPushButton("Edit")
         self.comment_edit_button.setObjectName("detailEditButton")
@@ -1717,10 +1838,12 @@ class Dashboard(QWidget):
         choose.setObjectName("secondaryButton")
         choose.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
         choose.clicked.connect(self.choose_folder)
-        choose_scope = QPushButton("Test scope XML")
-        choose_scope.setObjectName("secondaryButton")
-        choose_scope.setToolTip("Select the test_scope.xml file containing the selected tests")
-        choose_scope.clicked.connect(self.choose_scope)
+        self.choose_scope_button = QPushButton("Test scope XML")
+        self.choose_scope_button.setObjectName("secondaryButton")
+        self.choose_scope_button.setToolTip(
+            "Select the test_scope.xml file containing the selected tests"
+        )
+        self.choose_scope_button.clicked.connect(self.choose_scope)
         scope_help = QPushButton("Scope help")
         scope_help.setObjectName("secondaryButton")
         scope_help.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxQuestion))
@@ -1741,7 +1864,7 @@ class Dashboard(QWidget):
         top.addWidget(reload_btn)
         top.addWidget(self.report_button)
         top.addWidget(self.clear_scope_button)
-        top.addWidget(choose_scope)
+        top.addWidget(self.choose_scope_button)
         top.addWidget(scope_help)
         top.addWidget(choose)
         top.addWidget(choose_xml)
@@ -1946,6 +2069,7 @@ class Dashboard(QWidget):
 
     def start_loading(self, message: str = "Discovering XML results…"):
         self.loading_label.setText(message)
+        self.loading_progress.setTextVisible(False)
         self.loading_progress.setRange(0, 0)
         self.loading_panel.show()
 
@@ -1959,9 +2083,27 @@ class Dashboard(QWidget):
         self.loading_panel.hide()
         self.loading_label.setToolTip("")
 
+    def set_results_loading(self, active: bool):
+        self.choose_scope_button.setEnabled(not active)
+
     def set_report_generating(self, active: bool):
         self.report_button.setEnabled(not active)
         self.report_button.setText("Generating PDF..." if active else "Report PDF")
+        if active:
+            self.loading_label.setText("Generating PDF report — 0%")
+            self.loading_progress.setTextVisible(True)
+            self.loading_progress.setRange(0, 100)
+            self.loading_progress.setValue(0)
+            self.loading_panel.show()
+        else:
+            self.stop_loading()
+            self.loading_progress.setTextVisible(False)
+
+    def update_report_progress(self, percent: int, message: str):
+        percent = max(0, min(100, percent))
+        self.loading_progress.setRange(0, 100)
+        self.loading_progress.setValue(percent)
+        self.loading_label.setText(f"Generating PDF report — {percent}% · {message}")
 
     def _open_index(self, proxy_index: QModelIndex):
         source = self.proxy.mapToSource(proxy_index)
@@ -2224,6 +2366,12 @@ class MainWindow(QMainWindow):
             self.set_scope_file(Path(chosen))
 
     def set_scope_file(self, scope_file: Path, silent: bool = False):
+        if self.scanning:
+            self.statusBar().showMessage(
+                "Wait for all results to finish loading before selecting the test scope.",
+                5000,
+            )
+            return
         scope_file = normalized_path(scope_file)
         self._scope_job_path = scope_file
         self._scope_job_silent = silent
@@ -2333,6 +2481,7 @@ class MainWindow(QMainWindow):
         output_dir = APP_DIR / "output" / "pdf"
         job = ReportJob(self.source_path, self.scope_file, output_dir)
         self._report_job = job
+        job.signals.progress.connect(self.dashboard.update_report_progress)
         job.signals.finished.connect(self.report_finished)
         self.pool.start(job)
 
@@ -2377,6 +2526,7 @@ class MainWindow(QMainWindow):
             self.pending_refresh = True
             return
         self.scanning = True
+        self.dashboard.set_results_loading(True)
         self.dashboard.start_loading()
         self._network_start(self.source_path, "Discovering and reading XML results.")
         self.statusBar().showMessage("Reading XML results…")
@@ -2397,6 +2547,10 @@ class MainWindow(QMainWindow):
         self._network_stop(scanned_source)
         if not self.source_path or scanned_source != normalized_path(self.source_path):
             self.pending_refresh = False
+            if not self.source_path:
+                self.dashboard.stop_loading()
+                self.dashboard.set_results_loading(False)
+                return
             self.refresh()
             return
         refresh_requested = self.pending_refresh
@@ -2416,6 +2570,7 @@ class MainWindow(QMainWindow):
             )
             self.dashboard.stop_loading()
             self.statusBar().showMessage(f"{len(records)} results loaded", 4000)
+        self.dashboard.set_results_loading(False)
         if refresh_requested:
             self.refresh_timer.start()
 
@@ -2575,6 +2730,7 @@ QLabel#badge_unknown { background: #F1F5F9; color: #526174; border-radius: 17px;
 QPushButton { background: #3974D8; color: white; border: 0; border-radius: 8px; padding: 8px 12px; font-weight: 650; }
 QPushButton:hover { background: #2E63BD; }
 QPushButton#secondaryButton { background: #EAF1FC; color: #2E63BD; }
+QPushButton#secondaryButton:disabled { background: #E2E5EA; color: #9AA3B1; border: 1px solid #D4D9E1; }
 QPushButton#reportButton { background: #4F9A7D; color: white; }
 QPushButton#reportButton:hover { background: #43866D; }
 QPushButton#reportButton:disabled { background: #A9CDBF; color: #F3FAF7; }
