@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -551,14 +552,48 @@ def _parse_timestamp(value: str) -> datetime | None:
     return None
 
 
-def read_xml_text(path: Path) -> tuple[str, str]:
-    """Decode One4All XML, including legacy Windows-1252 result files."""
-    data = path.read_bytes()
+def _decode_xml_bytes(data: bytes) -> tuple[str, str]:
     try:
         return data.decode("utf-8"), ""
     except UnicodeDecodeError:
         text = data.decode("cp1252", errors="replace").replace("\ufffd", "?")
         return text, "Decoded using the Windows-1252 fallback."
+
+
+def read_xml_text(path: Path) -> tuple[str, str]:
+    """Decode a complete One4All XML, including legacy Windows-1252 files."""
+    return _decode_xml_bytes(path.read_bytes())
+
+
+def read_xml_summary_text(path: Path) -> tuple[str, str]:
+    """Read only the metadata needed by the results overview.
+
+    One4All stores the test metadata at the beginning and ``filestop`` at the
+    end. Large step histories between them are loaded later, when details open.
+    """
+    head_limit = 64 * 1024
+    tail_limit = 8 * 1024
+    with path.open("rb") as source:
+        head = source.read(head_limit)
+        if len(head) < head_limit:
+            return _decode_xml_bytes(head)
+
+        test_end = head.lower().find(b"</test>")
+        if test_end >= 0:
+            head = head[:test_end + len(b"</test>")]
+
+        source.seek(0, os.SEEK_END)
+        size = source.tell()
+        source.seek(max(0, size - tail_limit))
+        tail = source.read(tail_limit)
+
+    # Start the tail on an XML tag so a split multibyte character cannot force
+    # an otherwise UTF-8 file through the legacy decoder.
+    filestop = tail.lower().rfind(b"filestop=")
+    tag_start = tail.rfind(b"<", 0, filestop) if filestop >= 0 else tail.find(b"<")
+    if tag_start >= 0:
+        tail = tail[tag_start:]
+    return _decode_xml_bytes(head + b"\n" + tail)
 
 
 def _status_from_name(name: str) -> tuple[str, bool]:
@@ -582,7 +617,8 @@ def outcome_from_name(name: str) -> str:
 def parse_result(path: Path, include_evaluations: bool = True) -> TestRecord:
     warning = ""
     try:
-        raw, warning = read_xml_text(path)
+        reader = read_xml_text if include_evaluations else read_xml_summary_text
+        raw, warning = reader(path)
     except OSError as exc:
         raw, warning = "", str(exc)
 
@@ -660,22 +696,77 @@ class ScanSignals(QObject):
 
 
 class ScanJob(QRunnable):
-    def __init__(self, source: Path):
+    def __init__(
+        self,
+        source: Path,
+        cache: dict[str, tuple[int, int, TestRecord]] | None = None,
+    ):
         super().__init__()
         self.source = source
+        self.cache = cache if cache is not None else {}
         self.signals = ScanSignals()
+
+    @staticmethod
+    def _discover(source: Path) -> list[tuple[Path, int, int]]:
+        if source.is_file():
+            if source.suffix.lower() != ".xml":
+                return []
+            stat = source.stat()
+            return [(source, stat.st_size, stat.st_mtime_ns)]
+
+        discovered: list[tuple[Path, int, int]] = []
+        pending = [source]
+        while pending:
+            folder = pending.pop()
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(Path(entry.path))
+                    elif entry.is_file(follow_symlinks=False) and entry.name.lower().endswith(".xml"):
+                        stat = entry.stat(follow_symlinks=False)
+                        discovered.append((Path(entry.path), stat.st_size, stat.st_mtime_ns))
+        discovered.sort(key=lambda item: item[0].name.lower())
+        return discovered
 
     def run(self):
         try:
-            if self.source.is_file():
-                paths = [self.source] if self.source.suffix.lower() == ".xml" else []
-            else:
-                paths = sorted(self.source.rglob("*.xml"), key=lambda p: p.name.lower())
-            records = []
-            total = len(paths)
-            for current, path in enumerate(paths, 1):
-                records.append(parse_result(path, include_evaluations=False))
-                self.signals.progress.emit(current, total, path.name, self.source)
+            files = self._discover(self.source)
+            total = len(files)
+            records: list[TestRecord | None] = [None] * total
+            next_cache: dict[str, tuple[int, int, TestRecord]] = {}
+            missing: list[tuple[int, Path, int, int, str]] = []
+            completed = 0
+
+            for index, (path, size, modified_ns) in enumerate(files):
+                key = os.path.normcase(os.path.abspath(os.fspath(path)))
+                cached = self.cache.get(key)
+                if cached and cached[:2] == (size, modified_ns):
+                    record = cached[2]
+                    records[index] = record
+                    next_cache[key] = cached
+                    completed += 1
+                    self.signals.progress.emit(completed, total, path.name, self.source)
+                else:
+                    missing.append((index, path, size, modified_ns, key))
+
+            if missing:
+                worker_count = min(4, len(missing))
+                with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="result-summary") as pool:
+                    futures = {
+                        pool.submit(parse_result, path, False): (index, path, size, modified_ns, key)
+                        for index, path, size, modified_ns, key in missing
+                    }
+                    for future in as_completed(futures):
+                        index, path, size, modified_ns, key = futures[future]
+                        record = future.result()
+                        records[index] = record
+                        next_cache[key] = (size, modified_ns, record)
+                        completed += 1
+                        self.signals.progress.emit(completed, total, path.name, self.source)
+
+            self.cache.clear()
+            self.cache.update(next_cache)
+            records = [record for record in records if record is not None]
             error = ""
         except Exception as exc:  # keep worker failures visible in the UI
             records, error = [], str(exc)
@@ -2251,7 +2342,7 @@ class Dashboard(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Tridonic One4All Viewer — Version 1.3")
+        self.setWindowTitle("Tridonic One4All Viewer — Version 1.4")
         self.resize(1440, 900); self.setMinimumSize(1200, 760)
         self.qa_store = QAMemberStore()
         self.model = ResultsModel(self.qa_store); self.proxy = ResultsProxy(); self.proxy.setSourceModel(self.model)
@@ -2290,7 +2381,8 @@ class MainWindow(QMainWindow):
         self._scope_job: ScopeLoadJob | None = None
         self._scope_job_silent = False
         self._network_activity_count = 0
-        version_label = QLabel("VERSION 1.3")
+        self._scan_cache: dict[str, tuple[int, int, TestRecord]] = {}
+        version_label = QLabel("VERSION 1.4")
         version_label.setObjectName("footerMeta")
         powered_label = QLabel("POWERED BY PT TEAM")
         powered_label.setObjectName("footerBrand")
@@ -2339,6 +2431,7 @@ class MainWindow(QMainWindow):
         folder = normalized_path(folder)
         self.folder = folder
         self.source_path = folder
+        self._scan_cache.clear()
         old = self.watcher.directories()
         if old: self.watcher.removePaths(old)
         old_files = self.watcher.files()
@@ -2360,6 +2453,7 @@ class MainWindow(QMainWindow):
             return
         self.folder = file_path.parent
         self.source_path = file_path
+        self._scan_cache.clear()
         old = self.watcher.directories()
         if old: self.watcher.removePaths(old)
         old_files = self.watcher.files()
@@ -2368,30 +2462,17 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def choose_folder(self):
-        # The native Windows folder picker hides files, which makes a results
-        # folder look empty.  Qt's dialog can show the XML contents while still
-        # keeping the selection at directory level.
-        dialog = QFileDialog(
+        # Use the native folder-only picker. Showing XML files here forces Qt to
+        # enumerate every result while browsing a network drive, before the
+        # user has even selected the folder.
+        chosen = QFileDialog.getExistingDirectory(
             self,
-            "Select results folder (XML files are shown for reference)",
+            "Select results folder",
             str(self.folder or Path.home()),
+            QFileDialog.Option.ShowDirsOnly,
         )
-        dialog.setFileMode(QFileDialog.FileMode.Directory)
-        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
-        dialog.setOption(QFileDialog.Option.ShowDirsOnly, False)
-        dialog.setNameFilters(["XML result files (*.xml)", "All files (*)"])
-        dialog.setViewMode(QFileDialog.ViewMode.Detail)
-        dialog.setLabelText(QFileDialog.DialogLabel.Accept, "Select folder")
-
-        if dialog.exec():
-            selected = dialog.selectedFiles()
-            if selected:
-                chosen = Path(selected[0])
-                # If an XML was highlighted for inspection, use its containing
-                # folder because report generation always works at folder level.
-                if chosen.suffix.lower() == ".xml":
-                    chosen = chosen.parent
-                self.set_folder(chosen)
+        if chosen:
+            self.set_folder(Path(chosen))
 
     def choose_scope_file(self):
         start = str(self.scope_file.parent if self.scope_file else Path.home())
@@ -2569,7 +2650,7 @@ class MainWindow(QMainWindow):
         self.dashboard.start_loading()
         self._network_start(self.source_path, "Discovering and reading XML results.")
         self.statusBar().showMessage("Reading XML results…")
-        job = ScanJob(self.source_path)
+        job = ScanJob(self.source_path, self._scan_cache)
         job.signals.progress.connect(self.scan_progress)
         job.signals.finished.connect(self.scan_finished)
         self.pool.start(job)
@@ -2812,7 +2893,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Tridonic One4All Viewer")
     app.setApplicationDisplayName("Tridonic One4All Viewer")
-    app.setApplicationVersion("1.3")
+    app.setApplicationVersion("1.4")
     icon_path = APP_DIR / "app_icon.ico"
     if icon_path.is_file():
         app.setWindowIcon(QIcon(str(icon_path)))

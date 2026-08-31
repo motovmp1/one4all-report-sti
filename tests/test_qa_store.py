@@ -23,9 +23,11 @@ from main import (
     ReportJob,
     ResultsModel,
     ResultsProxy,
+    ScanJob,
     ScopeLoadJob,
     TestRecord,
     is_network_path,
+    parse_result,
 )
 
 
@@ -417,6 +419,34 @@ class QAMemberStoreTests(unittest.TestCase):
         dashboard._clear_filters()
         self.assertEqual(proxy.rowCount(), 3)
         dashboard.deleteLater()
+
+    def test_large_result_summary_matches_full_metadata_and_is_cached(self):
+        results = self.folder / "results"
+        results.mkdir()
+        result = results / "21.4 Network summary - passed.xml"
+        result.write_bytes(
+            b'<XML filestart="31-08-26_10h-00min-00s">\n'
+            b'<TEST><DATA name="DUT" value="DUT A"/>'
+            b'<DATA name="Tester ID" value="ALICE"/></TEST>\n'
+            + (b" " * (1024 * 1024))
+            + b'\n<DATA filestop="31-08-26_10h-02min-30s" />\n</XML>'
+        )
+
+        summary = parse_result(result, include_evaluations=False)
+        complete = parse_result(result, include_evaluations=True)
+        for field in (
+            "test_id", "title", "status", "started", "stopped",
+            "duration_seconds", "dut", "tester",
+        ):
+            self.assertEqual(getattr(summary, field), getattr(complete, field))
+
+        cache = {}
+        with patch("main.parse_result", wraps=parse_result) as parser:
+            ScanJob(results, cache).run()
+            self.assertEqual(parser.call_count, 1)
+            parser.reset_mock()
+            ScanJob(results, cache).run()
+            self.assertEqual(parser.call_count, 0)
 
 
 if __name__ == "__main__":

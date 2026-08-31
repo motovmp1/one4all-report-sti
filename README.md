@@ -2,7 +2,7 @@
 
 A PySide6 desktop application for reviewing One4All XML test results.
 
-Branded as **TRIDONIC — WE MANAGE LIGHT**, Version 1.3, powered by PT Team.
+Branded as **TRIDONIC — WE MANAGE LIGHT**, Version 1.4, powered by PT Team.
 
 ## Tools used and tested
 
@@ -20,7 +20,7 @@ final Setup `.exe` do not need Python, pip, PySide6, PyInstaller, or Inno Setup.
 
 ### Changes made on the current build computer
 
-During creation of the Version 1.3 installer:
+During creation of the Version 1.4 installer:
 
 - the existing Python 3.14.6 and project `.venv` were used;
 - PyInstaller 6.21.0 and its build dependencies were installed inside `.venv`
@@ -96,7 +96,7 @@ the `test_scope.xml` file next to `main.py` when available.
 Share this file with users who do not have Python installed:
 
 ```text
-release\Tridonic-One4All-Viewer-Setup-1.3.exe
+release\Tridonic-One4All-Viewer-Setup-1.4.exe
 ```
 
 The installer contains Python, PySide6, and all runtime dependencies. It installs
@@ -127,14 +127,14 @@ The build script performs these steps automatically:
 The finished installer is written to:
 
 ```text
-release\Tridonic-One4All-Viewer-Setup-1.3.exe
+release\Tridonic-One4All-Viewer-Setup-1.4.exe
 ```
 
 Confirm that it exists and calculate its checksum with:
 
 ```powershell
-Get-Item .\release\Tridonic-One4All-Viewer-Setup-1.3.exe
-Get-FileHash .\release\Tridonic-One4All-Viewer-Setup-1.3.exe -Algorithm SHA256
+Get-Item .\release\Tridonic-One4All-Viewer-Setup-1.4.exe
+Get-FileHash .\release\Tridonic-One4All-Viewer-Setup-1.4.exe -Algorithm SHA256
 ```
 
 To change the public version number, update it consistently in:
@@ -163,8 +163,11 @@ installer; no manual PyInstaller or Inno Setup command is required.
 
 - two independent result modes: open one XML file or load an entire folder;
 - recursive, dynamic XML discovery in folder mode;
+- native folder-only selection avoids enumerating result files while browsing network drives;
 - two-phase XML loading: lightweight summaries populate the dashboard first,
   while complete step details are parsed in the background only when opened;
+- overview summaries read only XML metadata boundaries, use up to four concurrent
+  reads, and cache unchanged files for faster network refreshes;
 - completed scans remain visible when filesystem changes queue another refresh;
 - Passed, Failed, Skipped, Aborted, Draft, and Unknown states;
 - combined search, status, and dynamic Function Block number filters;
