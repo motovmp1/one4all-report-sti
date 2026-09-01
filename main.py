@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ctypes
 import html
 import os
 import re
 import sys
+import textwrap
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -29,7 +31,7 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -96,8 +98,6 @@ def is_network_path(path: Path | None) -> bool:
         return True
     if os.name == "nt" and drive:
         try:
-            import ctypes
-
             return ctypes.windll.kernel32.GetDriveTypeW(f"{drive}\\") == 4
         except (AttributeError, OSError):
             pass
@@ -183,6 +183,60 @@ class QAMemberStore:
         self.assignments = assignments
         self.warning = warning
 
+    def _assert_data_file_available(self):
+        """Fail before editing when Relationships.xml is open or unavailable."""
+        path = self.data_file
+        if path is None:
+            raise OSError("Select the matching test_scope.xml before saving QA data.")
+        if not path.is_file():
+            return
+        if os.name != "nt":
+            try:
+                with path.open("r+b"):
+                    return
+            except OSError as exc:
+                raise OSError(
+                    f"{RELATIONSHIPS_DATA_FILE_NAME} is not available for writing: {exc}"
+                ) from exc
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        )
+        create_file.restype = ctypes.c_void_p
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (ctypes.c_void_p,)
+        close_handle.restype = ctypes.c_int
+        handle = create_file(
+            os.fspath(path),
+            0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
+            0,  # exclusive access: no read/write/delete sharing
+            None,
+            3,  # OPEN_EXISTING
+            0x80,  # FILE_ATTRIBUTE_NORMAL
+            None,
+        )
+        invalid_handle = ctypes.c_void_p(-1).value
+        if handle == invalid_handle:
+            error_code = ctypes.get_last_error()
+            if error_code in (32, 33):  # sharing or lock violation
+                raise OSError(
+                    f"{RELATIONSHIPS_DATA_FILE_NAME} is in use by another application. "
+                    "The QA change was not saved."
+                )
+            raise OSError(
+                f"{RELATIONSHIPS_DATA_FILE_NAME} is not available for writing "
+                f"(Windows error {error_code}). The QA change was not saved."
+            )
+        close_handle(handle)
+
     def _load_or_create_tree(self) -> tuple[ET.ElementTree, ET.Element]:
         path = self.data_file
         if path is None:
@@ -206,10 +260,36 @@ class QAMemberStore:
             raise OSError("Select the matching test_scope.xml before saving QA data.")
         path.parent.mkdir(parents=True, exist_ok=True)
         ET.indent(tree, space="  ")
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        tree.write(temporary, encoding="utf-8", xml_declaration=True)
-        temporary.replace(path)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            tree.write(temporary, encoding="utf-8", xml_declaration=True)
+            ET.parse(temporary)  # never replace the shared file with invalid XML
+            self._assert_data_file_available()
+            temporary.replace(path)
+            ET.parse(path)  # confirm that the shared destination is readable
+        except (OSError, ET.ParseError) as exc:
+            if "change was not saved" in str(exc):
+                raise
+            if getattr(exc, "winerror", None) in (32, 33):
+                raise OSError(
+                    f"{RELATIONSHIPS_DATA_FILE_NAME} is in use by another application. "
+                    "The QA change was not saved."
+                ) from exc
+            raise OSError(
+                f"{RELATIONSHIPS_DATA_FILE_NAME} could not be saved. "
+                f"The QA change was not saved: {exc}"
+            ) from exc
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
         self.reload()
+        if self.warning:
+            raise OSError(
+                f"{RELATIONSHIPS_DATA_FILE_NAME} was written but could not be verified: "
+                f"{self.warning}"
+            )
 
     def add_member(self, name: str) -> QAMember:
         clean_name = name.strip()
@@ -290,6 +370,7 @@ class QAMemberStore:
         return element
 
     def assign_member(self, path: Path, member_id: str):
+        self._assert_data_file_available()
         tree, root = self._load_or_create_tree()
         member = self.member_by_id(member_id)
         tester = member.name if member else member_id.strip()
@@ -297,6 +378,7 @@ class QAMemberStore:
         self._write_tree(tree)
 
     def assign_comment(self, path: Path, qa_comment: str):
+        self._assert_data_file_available()
         tree, root = self._load_or_create_tree()
         self._relationship_element(root, path).set("Comment", qa_comment.strip())
         self._write_tree(tree)
@@ -616,6 +698,38 @@ def format_duration(seconds: int | None) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
+def comment_table_preview(value: str, line_width: int = 78, max_lines: int = 3) -> str:
+    """Preserve authored line breaks and mark only genuinely hidden content."""
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return "-"
+    visual_lines: list[str] = []
+    overflow = False
+    authored_lines = normalized.split("\n")
+    for authored_index, authored_line in enumerate(authored_lines):
+        wrapped = textwrap.wrap(
+            authored_line,
+            width=line_width,
+            break_long_words=True,
+            break_on_hyphens=False,
+        ) or [""]
+        remaining_slots = max_lines - len(visual_lines)
+        if remaining_slots <= 0:
+            overflow = True
+            break
+        visual_lines.extend(wrapped[:remaining_slots])
+        if len(wrapped) > remaining_slots or authored_index < len(authored_lines) - 1 and len(visual_lines) >= max_lines:
+            overflow = True
+            break
+    if overflow:
+        arrow = "  →"
+        last = visual_lines[-1]
+        if len(last) + len(arrow) > line_width:
+            last = last[: line_width - len(arrow)].rstrip()
+        visual_lines[-1] = last + arrow
+    return "\n".join(visual_lines)
+
+
 class ScanSignals(QObject):
     finished = Signal(object, object, object)
     progress = Signal(int, int, str, object)
@@ -866,6 +980,8 @@ class ResultsModel(QAbstractTableModel):
             record.qa_comment or "-",
         )
         if role == Qt.DisplayRole:
+            if index.column() == self.QA_COMMENT_COLUMN:
+                return comment_table_preview(record.qa_comment)
             return values[index.column()]
         if role == Qt.EditRole:
             if index.column() == self.QA_COLUMN:
@@ -1098,6 +1214,48 @@ class InstantToolTipFilter(QObject):
         return super().eventFilter(watched, event)
 
 
+class ScopeStackedBar(QWidget):
+    """Scope completion bar: passed, completed non-pass, and missing."""
+
+    def __init__(self):
+        super().__init__()
+        self.passed = 0
+        self.non_passed = 0
+        self.total = 0
+        self.setFixedHeight(8)
+        self.setMinimumWidth(40)
+
+    def set_values(self, passed: int, non_passed: int, total: int):
+        self.passed = max(0, passed)
+        self.non_passed = max(0, non_passed)
+        self.total = max(0, total)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect())
+        clip = QPainterPath()
+        clip.addRoundedRect(rect, 4, 4)
+        painter.setClipPath(clip)
+        painter.fillRect(rect, QColor("#FFFFFF"))
+        if self.total:
+            passed_width = rect.width() * min(self.passed, self.total) / self.total
+            completed_non_pass = min(self.non_passed, max(0, self.total - self.passed))
+            non_passed_width = rect.width() * completed_non_pass / self.total
+            if passed_width:
+                painter.fillRect(QRectF(rect.left(), rect.top(), passed_width, rect.height()), QColor("#69AD92"))
+            if non_passed_width:
+                painter.fillRect(
+                    QRectF(rect.left() + passed_width, rect.top(), non_passed_width, rect.height()),
+                    QColor("#DC4C64"),
+                )
+        painter.setClipping(False)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor("#E3E8EF"), 1))
+        painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4)
+
+
 class ClusterCard(QFrame):
     def __init__(self, group: ScopeGroup, records: list[TestRecord]):
         super().__init__()
@@ -1126,6 +1284,7 @@ class ClusterCard(QFrame):
         self.executed = executed
         self.missing = missing
         pass_percent = self.pass_percent
+        execution_percent = executed * 100 / total if total else 0
         disabled = total == 0
         self.setProperty("scopeDisabled", disabled)
         self.setFixedHeight(24)
@@ -1142,18 +1301,16 @@ class ClusterCard(QFrame):
         selected_count.setObjectName("scopeCountDisabled" if disabled else "scopeCount")
         selected_count.setFixedSize(21, 17)
         selected_count.setAlignment(Qt.AlignCenter)
-        percent = QLabel("—" if disabled else f"{pass_percent:.0f}%")
+        percent = QLabel("—" if disabled else f"{execution_percent:.0f}%")
         percent.setFixedWidth(32)
         percent.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         percent.setStyleSheet(
             f"font-weight: 700; color: {'#A6AFBE' if disabled else '#253653'}; font-size: 10px;"
         )
-        bar = QProgressBar()
-        bar.setRange(0, 1000)
-        bar.setValue(round(pass_percent * 10))
-        bar.setTextVisible(False)
-        bar.setFixedHeight(8)
-        bar.setObjectName("scopeProgressDisabled" if disabled else "scopeProgress")
+        bar = ScopeStackedBar()
+        bar.set_values(passed, executed - passed, total)
+        self.bar = bar
+        self.percent_label = percent
         layout.addWidget(name)
         layout.addWidget(selected_count)
         layout.addWidget(bar, 1)
@@ -1176,7 +1333,8 @@ class ClusterCard(QFrame):
                 f"Unknown: <b>{result_counts['unknown']}</b><br>"
                 f"Completed: <b>{executed}</b><br>"
                 f"Missing: <b>{missing}</b><br>"
-                f"Pass rate: <b>{pass_percent:.1f}%</b>"
+                f"Pass rate: <b>{pass_percent:.1f}%</b><br>"
+                f"Scope completed: <b>{execution_percent:.1f}%</b>"
             )
         for widget in (self, name, selected_count, bar, percent):
             widget.setToolTip(tooltip)
@@ -1472,7 +1630,7 @@ class DetailPage(QWidget):
 
     @staticmethod
     def _display_comment(value: str) -> str:
-        return " ".join(value.split()) or "-"
+        return value.strip() or "-"
 
     def _reload_member_combo(self, selected_id: str = ""):
         self.qa_combo.clear()
@@ -1640,11 +1798,30 @@ class DetailPage(QWidget):
     def _show_qa_error(self, error: str, retry):
         message = QMessageBox(self)
         message.setIcon(QMessageBox.Icon.Warning)
-        message.setWindowTitle("Unable to update QA data")
-        message.setText(error)
+        file_in_use = "is in use by another application" in error
+        message.setWindowTitle(
+            f"{RELATIONSHIPS_DATA_FILE_NAME} is in use"
+            if file_in_use
+            else "Unable to update QA data"
+        )
+        message.setText(
+            "The QA change was not saved."
+            if file_in_use
+            else error
+        )
         retry_button = None
-        if is_network_path(self.qa_store.data_file):
-            message.setInformativeText("Check the VPN or network drive connection and try again.")
+        if file_in_use:
+            message.setInformativeText(
+                "Ask the team to close the legacy Test Manager using this scope, "
+                "then click Retry."
+            )
+            message.setDetailedText(error)
+            retry_button = message.addButton("Retry", QMessageBox.ButtonRole.AcceptRole)
+        elif is_network_path(self.qa_store.data_file):
+            message.setInformativeText(
+                "Check the VPN or network drive connection and try again. "
+                "If the legacy Test Manager is open, ask the team to close it."
+            )
             retry_button = message.addButton("Retry", QMessageBox.ButtonRole.AcceptRole)
         message.addButton(QMessageBox.StandardButton.Cancel)
         message.exec()
@@ -1978,7 +2155,10 @@ class Dashboard(QWidget):
         self.table = QTableView(); self.table.setModel(proxy); self.table.setSortingEnabled(True)
         self.table.setSelectionBehavior(QTableView.SelectRows); self.table.setSelectionMode(QTableView.SingleSelection)
         self.table.setEditTriggers(QTableView.NoEditTriggers); self.table.verticalHeader().hide()
-        self.table.setAlternatingRowColors(True); self.table.setShowGrid(False); self.table.verticalHeader().setDefaultSectionSize(40)
+        self.table.setAlternatingRowColors(True); self.table.setShowGrid(False)
+        self.table.setWordWrap(True)
+        self.table.setTextElideMode(Qt.ElideNone)
+        self.table.verticalHeader().setDefaultSectionSize(58)
         header = self.table.horizontalHeader(); header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents); header.setSectionResizeMode(1, QHeaderView.Stretch)
         for col in range(2, 6): header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
@@ -2121,6 +2301,8 @@ class Dashboard(QWidget):
         elif not active:
             self.filter_animation.stop()
             self.filter_opacity.setOpacity(1.0)
+        if hasattr(self, "chart"):
+            self._update_distribution(self._records_matching_active_filters())
 
     def _scope_mode_changed(self, checked: bool):
         self.scope_mode.setText("Load scope results" if checked else "Load all results")
@@ -2133,11 +2315,43 @@ class Dashboard(QWidget):
             return [record for record in self._records if record.test_id in self._scope_ids]
         return self._records
 
+    def _records_matching_active_filters(self) -> list[TestRecord]:
+        """Return the same records currently accepted by the table proxy."""
+        query = self.search.text().casefold().strip()
+        status = self.status_filter.currentData()
+        function_block = self.number_filter.currentData()
+        filtered: list[TestRecord] = []
+        for record in self._records_for_current_mode():
+            if status != "all" and record.status != status:
+                continue
+            if function_block != "all" and record.family != function_block:
+                continue
+            searchable = " ".join(
+                (
+                    record.test_id,
+                    record.title,
+                    record.file_name,
+                    record.dut,
+                    record.tester,
+                    record.qa_member_name,
+                    record.qa_comment,
+                )
+            ).casefold()
+            if query and query not in searchable:
+                continue
+            filtered.append(record)
+        return filtered
+
     def _update_result_summary(self, records: list[TestRecord]):
         counts = {status: sum(record.status == status for record in records) for status in STATUS_META}
         total = len(records)
         for status, card in self.cards.items():
             card.set_value(counts[status], total)
+        self._update_distribution(self._records_matching_active_filters())
+
+    def _update_distribution(self, records: list[TestRecord]):
+        counts = {status: sum(record.status == status for record in records) for status in STATUS_META}
+        total = len(records)
         self.chart.set_counts(counts)
         while self.legend.count():
             item = self.legend.takeAt(0)
@@ -2323,7 +2537,7 @@ class Dashboard(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Tridonic One4All Viewer — Version 1.6")
+        self.setWindowTitle("Tridonic One4All Viewer — Version 1.9")
         self.resize(1440, 900); self.setMinimumSize(1200, 760)
         self.qa_store = QAMemberStore()
         self.model = ResultsModel(self.qa_store); self.proxy = ResultsProxy(); self.proxy.setSourceModel(self.model)
@@ -2363,7 +2577,7 @@ class MainWindow(QMainWindow):
         self._scope_job_silent = False
         self._network_activity_count = 0
         self._scan_cache: dict[str, tuple[int, int, TestRecord]] = {}
-        version_label = QLabel("VERSION 1.6")
+        version_label = QLabel("VERSION 1.9")
         version_label.setObjectName("footerMeta")
         powered_label = QLabel("POWERED BY PT TEAM")
         powered_label.setObjectName("footerBrand")
@@ -2877,7 +3091,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Tridonic One4All Viewer")
     app.setApplicationDisplayName("Tridonic One4All Viewer")
-    app.setApplicationVersion("1.6")
+    app.setApplicationVersion("1.9")
     icon_path = APP_DIR / "app_icon.ico"
     if icon_path.is_file():
         app.setWindowIcon(QIcon(str(icon_path)))

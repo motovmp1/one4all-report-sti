@@ -1,3 +1,4 @@
+import ctypes
 import os
 import shutil
 import time
@@ -14,6 +15,7 @@ from PySide6.QtCore import QThreadPool
 
 from generate_meeting_pdf import load_qa_member_names
 from main import (
+    ClusterCard,
     Dashboard,
     DetailPage,
     MainWindow,
@@ -27,6 +29,7 @@ from main import (
     ScopeGroup,
     ScopeLoadJob,
     TestRecord,
+    comment_table_preview,
     is_network_path,
     parse_result,
 )
@@ -112,6 +115,68 @@ class QAMemberStoreTests(unittest.TestCase):
         self.assertEqual(ET.parse(self.legacy_file).getroot().get("legacy"), "yes")
         self.assertFalse(self.obsolete_qa_file.exists())
 
+    def test_locked_relationships_file_is_never_replaced(self):
+        store = QAMemberStore()
+        store.set_data_file(self.data_file)
+        original = self.legacy_file.read_bytes()
+        locked_error = OSError(
+            "Relationships.xml is in use by another application. "
+            "The QA change was not saved."
+        )
+
+        with patch.object(
+            store,
+            "_assert_data_file_available",
+            side_effect=[None, locked_error],
+        ):
+            with self.assertRaisesRegex(OSError, "in use by another application"):
+                store.assign_comment(self.result, "must not be written")
+
+        self.assertEqual(self.legacy_file.read_bytes(), original)
+        self.assertEqual(list(self.folder.glob(".Relationships.xml.*.tmp")), [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows file-sharing semantics")
+    def test_windows_open_file_is_reported_as_in_use(self):
+        store = QAMemberStore()
+        store.set_data_file(self.data_file)
+        original = self.legacy_file.read_bytes()
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.restype = ctypes.c_void_p
+        handle = create_file(
+            os.fspath(self.legacy_file),
+            0x80000000,
+            0,
+            None,
+            3,
+            0x80,
+            None,
+        )
+        self.assertNotEqual(handle, ctypes.c_void_p(-1).value)
+        try:
+            with self.assertRaisesRegex(OSError, "in use by another application"):
+                store.assign_comment(self.result, "must not be written")
+        finally:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+        self.assertEqual(self.legacy_file.read_bytes(), original)
+
+    def test_comment_preview_uses_three_lines_and_continuation_arrow(self):
+        preview = comment_table_preview(
+            "1 - first line\n2 - second line\n3 - third line\n4 - hidden line",
+            line_width=40,
+            max_lines=3,
+        )
+
+        self.assertEqual(preview.splitlines()[:2], ["1 - first line", "2 - second line"])
+        self.assertEqual(len(preview.splitlines()), 3)
+        self.assertTrue(preview.endswith("→"))
+        self.assertEqual(
+            comment_table_preview("1 - one\n2 - two\n3 - three"),
+            "1 - one\n2 - two\n3 - three",
+        )
+        self.assertEqual(comment_table_preview("short comment"), "short comment")
+
     def test_comment_entry_is_created_dynamically_when_result_is_missing(self):
         other_result = self.folder / "31.2 new result.xml"
         store = QAMemberStore()
@@ -124,6 +189,17 @@ class QAMemberStoreTests(unittest.TestCase):
         self.assertEqual(created.get("Number"), "31.2")
         self.assertEqual(created.get("Comment"), "new shared comment")
         self.assertEqual(store.assignment_for(other_result).qa_comment, "new shared comment")
+
+    def test_comment_line_breaks_round_trip_through_relationships(self):
+        store = QAMemberStore()
+        store.set_data_file(self.data_file)
+        multiline = "1 - first action\n2 - second action\n3 - third action"
+
+        store.assign_comment(self.result, multiline)
+
+        self.assertEqual(store.assignment_for(self.result).qa_comment, multiline)
+        saved = ET.parse(self.legacy_file).getroot().find("./Test")
+        self.assertEqual(saved.get("Comment"), multiline)
 
     def test_unique_relationship_number_matches_an_abbreviated_name(self):
         self.legacy_file.write_text(
@@ -431,14 +507,21 @@ class QAMemberStoreTests(unittest.TestCase):
         )
         dashboard.number_filter.setCurrentIndex(dashboard.number_filter.findData("21"))
         self.assertEqual(proxy.rowCount(), 2)
+        self.assertEqual(dashboard.chart.counts["passed"], 1)
+        self.assertEqual(dashboard.chart.counts["failed"], 1)
+        self.assertEqual(sum(dashboard.chart.counts.values()), 2)
         dashboard.status_filter.setCurrentIndex(dashboard.status_filter.findData("failed"))
         self.assertEqual(proxy.rowCount(), 1)
+        self.assertEqual(dashboard.chart.counts["failed"], 1)
+        self.assertEqual(sum(dashboard.chart.counts.values()), 1)
         dashboard.search.setText("thermal")
         self.assertEqual(proxy.rowCount(), 1)
         dashboard.search.setText("recovery")
         self.assertEqual(proxy.rowCount(), 0)
         dashboard._clear_filters()
         self.assertEqual(proxy.rowCount(), 3)
+        self.assertEqual(dashboard.chart.counts["passed"], 2)
+        self.assertEqual(dashboard.chart.counts["failed"], 1)
 
         scope = self.folder / "test_scope.xml"
         scope.write_text("<Tests/>", encoding="utf-8")
@@ -465,6 +548,56 @@ class QAMemberStoreTests(unittest.TestCase):
         self.assertFalse(dashboard.scope_mode.isChecked())
         self.assertEqual(proxy.rowCount(), 3)
         dashboard.deleteLater()
+
+    def test_scope_group_uses_one_pass_fail_missing_bar_and_completion_percent(self):
+        records = [
+            TestRecord(
+                path=self.folder / "7.1 passed.xml",
+                file_name="7.1 passed.xml",
+                title="ITG passed one",
+                test_id="7.1",
+                family="7",
+                status="passed",
+                is_draft=False,
+                started=None,
+                stopped=None,
+                duration_seconds=None,
+            ),
+            TestRecord(
+                path=self.folder / "7.2 passed.xml",
+                file_name="7.2 passed.xml",
+                title="ITG passed two",
+                test_id="7.2",
+                family="7",
+                status="passed",
+                is_draft=False,
+                started=None,
+                stopped=None,
+                duration_seconds=None,
+            ),
+            TestRecord(
+                path=self.folder / "7.3 failed.xml",
+                file_name="7.3 failed.xml",
+                title="ITG failed",
+                test_id="7.3",
+                family="7",
+                status="failed",
+                is_draft=False,
+                started=None,
+                stopped=None,
+                duration_seconds=None,
+            ),
+        ]
+        card = ClusterCard(ScopeGroup("07_ITG", "07", {"7.1", "7.2", "7.3", "7.4"}), records)
+
+        self.assertEqual(card.bar.passed, 2)
+        self.assertEqual(card.bar.non_passed, 1)
+        self.assertEqual(card.bar.total, 4)
+        self.assertEqual(card.percent_label.text(), "75%")
+        self.assertIn("Scope completed: <b>75.0%</b>", card.toolTip())
+        card.show()
+        self.app.processEvents()
+        card.deleteLater()
 
     def test_large_result_summary_matches_full_metadata_and_is_cached(self):
         results = self.folder / "results"

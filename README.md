@@ -2,7 +2,24 @@
 
 A PySide6 desktop application for reviewing One4All XML test results.
 
-Branded as **TRIDONIC — WE MANAGE LIGHT**, Version 1.6, powered by PT Team.
+Branded as **TRIDONIC — WE MANAGE LIGHT**, Version 1.9, powered by PT Team.
+
+Version 1.9 preserves the line breaks authored in QA comments. The result table
+shows up to three formatted lines and adds a continuation arrow only when more
+content is hidden. Successful QA saves are silent; a popup is shown only when
+the shared XML cannot be updated.
+
+Version 1.8 retains the filter-aware Distribution chart and segmented Function
+Block progress from 1.7. Before saving QA assignments or comments, it now checks
+that `Relationships.xml` is not being used by the legacy Test Manager, writes
+through a validated temporary file, and confirms successful saves. Table
+comments show up to three lines and a continuation arrow when more text exists.
+
+Version 1.7 made the Distribution chart follow the active search, status, and
+Function Block filters. Scope progress uses one segmented line per Function
+Block: green for passed tests, red for completed non-pass tests, and white
+for tests that have not been executed. Its percentage is the total scope
+completion (`passed + non-pass`) rather than only the pass rate.
 
 ## Tools used and tested
 
@@ -20,7 +37,7 @@ final Setup `.exe` do not need Python, pip, PySide6, PyInstaller, or Inno Setup.
 
 ### Changes made on the current build computer
 
-During creation of the Version 1.6 installer:
+During creation of the Version 1.9 installer:
 
 - the existing Python 3.14.6 and project `.venv` were used;
 - PyInstaller 6.21.0 and its build dependencies were installed inside `.venv`
@@ -96,7 +113,7 @@ the `test_scope.xml` file next to `main.py` when available.
 Share this file with users who do not have Python installed:
 
 ```text
-release\Tridonic-One4All-Viewer-Setup-1.6.exe
+release\Tridonic-One4All-Viewer-Setup-1.9.exe
 ```
 
 The installer contains Python, PySide6, and all runtime dependencies. It installs
@@ -127,14 +144,14 @@ The build script performs these steps automatically:
 The finished installer is written to:
 
 ```text
-release\Tridonic-One4All-Viewer-Setup-1.6.exe
+release\Tridonic-One4All-Viewer-Setup-1.9.exe
 ```
 
 Confirm that it exists and calculate its checksum with:
 
 ```powershell
-Get-Item .\release\Tridonic-One4All-Viewer-Setup-1.6.exe
-Get-FileHash .\release\Tridonic-One4All-Viewer-Setup-1.6.exe -Algorithm SHA256
+Get-Item .\release\Tridonic-One4All-Viewer-Setup-1.9.exe
+Get-FileHash .\release\Tridonic-One4All-Viewer-Setup-1.9.exe -Algorithm SHA256
 ```
 
 To change the public version number, update it consistently in:
