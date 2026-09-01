@@ -41,7 +41,7 @@ PALE_BLUE = HexColor("#EDF4FF")
 PALE_GREEN = HexColor("#EDF8F3")
 PALE_RED = HexColor("#FCEFF1")
 PALE_AMBER = HexColor("#FFF6E7")
-QA_DATA_FILE_NAME = "One4All_QA_data.xml"
+RELATIONSHIPS_DATA_FILE_NAME = "Relationships.xml"
 ProgressCallback = Callable[[int, str], None]
 
 
@@ -191,26 +191,21 @@ def load_campaign_info(scope_path: Path) -> dict[str, str]:
 
 def load_qa_member_names(scope_path: Path, scoped: dict[str, Result]) -> list[str]:
     """Return QA members assigned to the latest scoped results."""
-    qa_path = scope_path.parent / QA_DATA_FILE_NAME
-    if not qa_path.is_file():
+    relationships_path = scope_path.parent / RELATIONSHIPS_DATA_FILE_NAME
+    if not relationships_path.is_file():
         return []
     try:
-        root = ET.parse(qa_path).getroot()
+        root = ET.parse(relationships_path).getroot()
     except (OSError, ET.ParseError):
         return []
-    members = {
-        (element.get("id") or "").strip().casefold(): (element.get("name") or "").strip()
-        for element in root.findall("./QAMembers/Member")
-        if (element.get("id") or "").strip() and (element.get("name") or "").strip()
-    }
     current_results = {result.path.name.casefold() for result in scoped.values()}
-    assigned_ids = {
-        (element.get("qaMemberId") or "").strip().casefold()
-        for element in root.findall("./Tests/Test")
-        if (element.get("result") or "").strip().casefold() in current_results
-        and (element.get("qaMemberId") or "").strip()
+    assigned_names = {
+        (element.get("Tester") or "").strip()
+        for element in root.findall("./Test")
+        if (element.findtext("Name", default="") or "").strip().casefold() in current_results
+        and (element.get("Tester") or "").strip()
     }
-    return sorted({members[member_id] for member_id in assigned_ids if member_id in members}, key=str.casefold)
+    return sorted(assigned_names, key=str.casefold)
 
 
 def filename_slug(value: str) -> str:

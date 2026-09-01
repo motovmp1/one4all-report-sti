@@ -2,7 +2,7 @@
 
 A PySide6 desktop application for reviewing One4All XML test results.
 
-Branded as **TRIDONIC — WE MANAGE LIGHT**, Version 1.4, powered by PT Team.
+Branded as **TRIDONIC — WE MANAGE LIGHT**, Version 1.6, powered by PT Team.
 
 ## Tools used and tested
 
@@ -20,7 +20,7 @@ final Setup `.exe` do not need Python, pip, PySide6, PyInstaller, or Inno Setup.
 
 ### Changes made on the current build computer
 
-During creation of the Version 1.4 installer:
+During creation of the Version 1.6 installer:
 
 - the existing Python 3.14.6 and project `.venv` were used;
 - PyInstaller 6.21.0 and its build dependencies were installed inside `.venv`
@@ -96,7 +96,7 @@ the `test_scope.xml` file next to `main.py` when available.
 Share this file with users who do not have Python installed:
 
 ```text
-release\Tridonic-One4All-Viewer-Setup-1.4.exe
+release\Tridonic-One4All-Viewer-Setup-1.6.exe
 ```
 
 The installer contains Python, PySide6, and all runtime dependencies. It installs
@@ -127,14 +127,14 @@ The build script performs these steps automatically:
 The finished installer is written to:
 
 ```text
-release\Tridonic-One4All-Viewer-Setup-1.4.exe
+release\Tridonic-One4All-Viewer-Setup-1.6.exe
 ```
 
 Confirm that it exists and calculate its checksum with:
 
 ```powershell
-Get-Item .\release\Tridonic-One4All-Viewer-Setup-1.4.exe
-Get-FileHash .\release\Tridonic-One4All-Viewer-Setup-1.4.exe -Algorithm SHA256
+Get-Item .\release\Tridonic-One4All-Viewer-Setup-1.6.exe
+Get-FileHash .\release\Tridonic-One4All-Viewer-Setup-1.6.exe -Algorithm SHA256
 ```
 
 To change the public version number, update it consistently in:
@@ -172,12 +172,14 @@ installer; no manual PyInstaller or Inno Setup command is required.
 - Passed, Failed, Skipped, Aborted, Draft, and Unknown states;
 - combined search, status, and dynamic Function Block number filters;
 - Function Block choices are generated only from the result IDs currently loaded;
+- a scope-results toggle switches between the legacy-compatible view (only IDs
+  selected in `test_scope.xml`) and every XML currently present in Results;
 - static, aligned **QA member** and **QA comment** columns in the overview table;
-- QA members and task assignments live in `One4All_QA_data.xml`, beside the
-  selected `test_scope.xml`;
-- the QA XML is created only when a user first adds a member or assigns QA data;
-- QA comments are read from and saved to the existing `Test_report_data.xml`
-  beside the selected scope, keeping the Viewer and legacy application synchronized;
+- QA assignments and comments are read from and saved to `Relationships.xml`
+  beside the selected scope, using the legacy `Tester` and `Comment` attributes;
+- existing legacy QA values populate the member selector dynamically, and new
+  values are persisted when assigned to a test;
+- `One4All_QA_data.xml` and `Test_report_data.xml` are not read, created, or modified;
 - result-step comments remain only in the detailed Steps table and are never
   copied into the initial overview;
 - inside a test's detail **Overview**, QA member and QA comment each have their own

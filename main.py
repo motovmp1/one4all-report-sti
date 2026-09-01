@@ -77,8 +77,7 @@ APP_DIR = (
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent
 )
-QA_DATA_FILE_NAME = "One4All_QA_data.xml"
-LEGACY_REPORT_DATA_FILE_NAME = "Test_report_data.xml"
+RELATIONSHIPS_DATA_FILE_NAME = "Relationships.xml"
 
 
 def normalized_path(path: Path) -> Path:
@@ -125,13 +124,12 @@ class QAAssignment:
 
 
 class QAMemberStore:
-    """QA members in app-owned XML and comments in the shared legacy XML."""
+    """QA assignments and comments shared with the legacy Test Manager."""
 
     def __init__(self):
         self.members: list[QAMember] = []
         self.assignments: dict[str, QAAssignment] = {}
         self.data_file: Path | None = None
-        self.comment_data_file: Path | None = None
         self.warning = ""
 
     def reload(self):
@@ -141,66 +139,36 @@ class QAMemberStore:
         path = self.data_file
         if not path:
             return
-        legacy_comments: dict[str, str] = {}
-        legacy_by_number: dict[str, list[str]] = {}
-        legacy_path = self.comment_data_file
-        if legacy_path and legacy_path.is_file():
-            try:
-                legacy_root = ET.parse(legacy_path).getroot()
-                for element in legacy_root.findall("./Test"):
-                    result_name = (element.findtext("Name", default="") or "").strip()
-                    if result_name:
-                        comment = (element.get("Comment") or "").strip()
-                        legacy_comments[result_name.casefold()] = comment
-                        number = (element.get("Number") or "").strip().casefold()
-                        if number:
-                            legacy_by_number.setdefault(number, []).append(comment)
-            except (OSError, ET.ParseError) as exc:
-                self.warning = f"{LEGACY_REPORT_DATA_FILE_NAME} could not be read: {exc}"
         if not path.is_file():
-            for result_name, comment in legacy_comments.items():
-                self.assignments[result_name] = QAAssignment("", comment)
-            for number, comments in legacy_by_number.items():
-                if len(comments) == 1:
-                    self.assignments[f"@test:{number}"] = QAAssignment("", comments[0])
             return
         try:
             root = ET.parse(path).getroot()
+            if root.tag != "Tests":
+                raise ET.ParseError("unsupported root element")
             seen: set[str] = set()
-            for element in root.findall("./QAMembers/Member"):
-                member_id = (element.get("id") or "").strip()
-                name = (element.get("name") or "").strip()
-                if member_id and name and member_id.casefold() not in seen:
-                    self.members.append(QAMember(member_id, name))
-                    seen.add(member_id.casefold())
-            for element in root.findall("./Tests/Test"):
-                result_name = (element.get("result") or "").strip()
-                member_id = (element.get("qaMemberId") or "").strip()
-                # Preserve comments written by versions 1.1/1.2 only as a
-                # fallback. Test_report_data.xml is now authoritative.
-                old_comment = element.findtext("Comment", default="").strip()
-                comment = legacy_comments.pop(result_name.casefold(), old_comment)
+            by_number: dict[str, list[QAAssignment]] = {}
+            for element in root.findall("./Test"):
+                result_name = (element.findtext("Name", default="") or "").strip()
+                tester = (element.get("Tester") or "").strip()
+                comment = (element.get("Comment") or "").strip()
+                if tester and tester.casefold() not in seen:
+                    self.members.append(QAMember(tester, tester))
+                    seen.add(tester.casefold())
                 if result_name:
-                    self.assignments[result_name.casefold()] = QAAssignment(member_id, comment)
-            for result_name, comment in legacy_comments.items():
-                current = self.assignments.get(result_name, QAAssignment())
-                self.assignments[result_name] = QAAssignment(current.member_id, comment)
-            for number, comments in legacy_by_number.items():
-                if len(comments) == 1:
-                    self.assignments[f"@test:{number}"] = QAAssignment("", comments[0])
+                    assignment = QAAssignment(tester, comment)
+                    self.assignments[result_name.casefold()] = assignment
+                    number = (element.get("Number") or "").strip().casefold()
+                    if number:
+                        by_number.setdefault(number, []).append(assignment)
+            for number, assignments in by_number.items():
+                if len(assignments) == 1:
+                    self.assignments[f"@test:{number}"] = assignments[0]
+            self.members.sort(key=lambda member: member.name.casefold())
         except (OSError, ET.ParseError) as exc:
-            qa_warning = f"{QA_DATA_FILE_NAME} could not be read: {exc}"
-            self.warning = f"{self.warning} {qa_warning}".strip()
+            self.warning = f"{RELATIONSHIPS_DATA_FILE_NAME} could not be read: {exc}"
 
-    def set_data_file(self, path: Path | None, comment_path: Path | None = None):
+    def set_data_file(self, path: Path | None):
         self.data_file = normalized_path(path) if path else None
-        self.comment_data_file = (
-            normalized_path(comment_path)
-            if comment_path
-            else self.data_file.parent / LEGACY_REPORT_DATA_FILE_NAME
-            if self.data_file
-            else None
-        )
         self.reload()
 
     def set_loaded_data(
@@ -211,9 +179,6 @@ class QAMemberStore:
         warning: str = "",
     ):
         self.data_file = normalized_path(path) if path else None
-        self.comment_data_file = (
-            self.data_file.parent / LEGACY_REPORT_DATA_FILE_NAME if self.data_file else None
-        )
         self.members = members
         self.assignments = assignments
         self.warning = warning
@@ -226,12 +191,12 @@ class QAMemberStore:
             try:
                 tree = ET.parse(path)
             except ET.ParseError as exc:
-                raise OSError(f"{QA_DATA_FILE_NAME} is not valid XML: {exc}") from exc
+                raise OSError(f"{RELATIONSHIPS_DATA_FILE_NAME} is not valid XML: {exc}") from exc
             root = tree.getroot()
-            if root.tag != "One4AllQAData":
-                raise OSError(f"{QA_DATA_FILE_NAME} has an unsupported root element.")
+            if root.tag != "Tests":
+                raise OSError(f"{RELATIONSHIPS_DATA_FILE_NAME} has an unsupported root element.")
         else:
-            root = ET.Element("One4AllQAData", version="1")
+            root = ET.Element("Tests")
             tree = ET.ElementTree(root)
         return tree, root
 
@@ -255,76 +220,32 @@ class QAMemberStore:
         )
         if existing:
             return existing
-        tree, root = self._load_or_create_tree()
-        members_node = root.find("QAMembers")
-        if members_node is None:
-            members_node = ET.SubElement(root, "QAMembers")
-        used_numbers = {
-            int(match.group(1))
-            for item in self.members
-            if (match := re.fullmatch(r"QA(\d+)", item.member_id, re.I))
-        }
-        number = 1
-        while number in used_numbers:
-            number += 1
-        member = QAMember(f"QA{number:03d}", clean_name)
-        ET.SubElement(members_node, "Member", id=member.member_id, name=member.name)
-        self._write_tree(tree)
-        return self.member_by_id(member.member_id) or member
+        # Relationships.xml has no global member directory. Keep the new value
+        # available in the editor; assigning it to a test persists it in Tester.
+        member = QAMember(clean_name, clean_name)
+        self.members.append(member)
+        self.members.sort(key=lambda item: item.name.casefold())
+        return member
 
     def member_by_id(self, member_id: str) -> QAMember | None:
         wanted = member_id.casefold().strip()
         return next((member for member in self.members if member.member_id.casefold() == wanted), None)
 
     def assignment_for(self, path: Path) -> QAAssignment:
-        exact = self.assignments.get(path.name.casefold(), QAAssignment())
-        if exact.qa_comment:
+        exact = self.assignments.get(path.name.casefold())
+        if exact is not None:
             return exact
         test_id_match = re.match(r"(\d+(?:\.\d+)*)", path.name)
         if not test_id_match:
-            return exact
-        fallback = self.assignments.get(
+            return QAAssignment()
+        return self.assignments.get(
             f"@test:{test_id_match.group(1).casefold()}", QAAssignment()
         )
-        return QAAssignment(exact.member_id, fallback.qa_comment)
 
     def resolved_member(self, path: Path) -> QAMember | None:
         return self.member_by_id(self.assignment_for(path).member_id)
 
-    def _assignment_element(self, root: ET.Element, path: Path) -> ET.Element:
-        tests_node = root.find("Tests")
-        if tests_node is None:
-            tests_node = ET.SubElement(root, "Tests")
-        for element in tests_node.findall("Test"):
-            if (element.get("result") or "").strip().casefold() == path.name.casefold():
-                return element
-        return ET.SubElement(tests_node, "Test", result=path.name)
-
-    def assign_member(self, path: Path, member_id: str):
-        tree, root = self._load_or_create_tree()
-        self._assignment_element(root, path).set("qaMemberId", member_id.strip())
-        self._write_tree(tree)
-
-    def assign_comment(self, path: Path, qa_comment: str):
-        legacy_path = self.comment_data_file
-        if legacy_path is None:
-            raise OSError("Select the matching test_scope.xml before saving a QA comment.")
-        if legacy_path.is_file():
-            try:
-                tree = ET.parse(legacy_path)
-            except ET.ParseError as exc:
-                raise OSError(
-                    f"{LEGACY_REPORT_DATA_FILE_NAME} is not valid XML: {exc}"
-                ) from exc
-            root = tree.getroot()
-            if root.tag != "Tests":
-                raise OSError(
-                    f"{LEGACY_REPORT_DATA_FILE_NAME} has an unsupported root element."
-                )
-        else:
-            root = ET.Element("Tests")
-            tree = ET.ElementTree(root)
-
+    def _relationship_element(self, root: ET.Element, path: Path) -> ET.Element:
         wanted = path.name.casefold()
         element = next(
             (
@@ -366,14 +287,19 @@ class QAMemberStore:
             )
             ET.SubElement(element, "Index").text = str(max(indices, default=-1) + 1)
             ET.SubElement(element, "Name").text = path.name
+        return element
 
-        element.set("Comment", qa_comment.strip())
-        legacy_path.parent.mkdir(parents=True, exist_ok=True)
-        ET.indent(tree, space="  ")
-        temporary = legacy_path.with_suffix(legacy_path.suffix + ".tmp")
-        tree.write(temporary, encoding="utf-8", xml_declaration=True)
-        temporary.replace(legacy_path)
-        self.reload()
+    def assign_member(self, path: Path, member_id: str):
+        tree, root = self._load_or_create_tree()
+        member = self.member_by_id(member_id)
+        tester = member.name if member else member_id.strip()
+        self._relationship_element(root, path).set("Tester", tester)
+        self._write_tree(tree)
+
+    def assign_comment(self, path: Path, qa_comment: str):
+        tree, root = self._load_or_create_tree()
+        self._relationship_element(root, path).set("Comment", qa_comment.strip())
+        self._write_tree(tree)
 
 
 def copy_path_icon() -> QIcon:
@@ -844,7 +770,7 @@ class ScopeLoadJob(QRunnable):
             groups = scan_test_scope(self.path)
             if not groups or not any(group.test_ids for group in groups):
                 raise ValueError("The selected XML does not contain any valid selected tests.")
-            qa_path = self.path.parent / QA_DATA_FILE_NAME
+            qa_path = self.path.parent / RELATIONSHIPS_DATA_FILE_NAME
             qa_store = QAMemberStore()
             qa_store.set_data_file(qa_path)
             payload = (groups, list(qa_store.members), dict(qa_store.assignments), qa_store.warning)
@@ -995,6 +921,7 @@ class ResultsProxy(QSortFilterProxyModel):
         self.query = ""
         self.status = "all"
         self.function_block = "all"
+        self.scope_ids: set[str] | None = None
 
     def set_query(self, value: str):
         self.beginFilterChange()
@@ -1011,6 +938,11 @@ class ResultsProxy(QSortFilterProxyModel):
         self.function_block = value
         self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
 
+    def set_scope_ids(self, value: set[str] | None):
+        self.beginFilterChange()
+        self.scope_ids = set(value) if value is not None else None
+        self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
+
     def filterAcceptsRow(self, source_row, source_parent):
         model: ResultsModel = self.sourceModel()
         record = model.records[source_row]
@@ -1018,11 +950,12 @@ class ResultsProxy(QSortFilterProxyModel):
         function_block_ok = (
             self.function_block == "all" or record.family == self.function_block
         )
+        scope_ok = self.scope_ids is None or record.test_id in self.scope_ids
         text = (
             f"{record.test_id} {record.title} {record.file_name} {record.dut} "
             f"{record.tester} {record.qa_member_name} {record.qa_comment}"
         ).casefold()
-        return status_ok and function_block_ok and (not self.query or self.query in text)
+        return status_ok and function_block_ok and scope_ok and (not self.query or self.query in text)
 
 
 class StepsModel(QAbstractTableModel):
@@ -1358,7 +1291,8 @@ class DetailPage(QWidget):
         self.qa_combo.setMaximumWidth(420)
         self.qa_combo.addItem("Not assigned", "")
         for member in self.qa_store.members:
-            self.qa_combo.addItem(f"{member.name} ({member.member_id})", member.member_id)
+            label = member.name if member.name == member.member_id else f"{member.name} ({member.member_id})"
+            self.qa_combo.addItem(label, member.member_id)
         selected = self.qa_combo.findData(record.qa_member_id)
         self.qa_combo.setCurrentIndex(max(0, selected))
         self.qa_combo.hide()
@@ -1544,7 +1478,8 @@ class DetailPage(QWidget):
         self.qa_combo.clear()
         self.qa_combo.addItem("Not assigned", "")
         for member in self.qa_store.members:
-            self.qa_combo.addItem(f"{member.name} ({member.member_id})", member.member_id)
+            label = member.name if member.name == member.member_id else f"{member.name} ({member.member_id})"
+            self.qa_combo.addItem(label, member.member_id)
         selected = self.qa_combo.findData(selected_id)
         self.qa_combo.setCurrentIndex(max(0, selected))
 
@@ -1897,6 +1832,8 @@ class Dashboard(QWidget):
     def __init__(self, model: ResultsModel, proxy: ResultsProxy):
         super().__init__()
         self.model, self.proxy = model, proxy
+        self._records: list[TestRecord] = []
+        self._scope_ids: set[str] = set()
         root = QVBoxLayout(self); root.setContentsMargins(18, 10, 18, 12); root.setSpacing(10)
         top = QHBoxLayout()
         heading = QVBoxLayout()
@@ -2003,6 +1940,15 @@ class Dashboard(QWidget):
         self.status_filter.setToolTip("Filter the loaded results by test status")
         self.number_filter = QComboBox(); self.number_filter.addItem("Filter by number", "all")
         self.number_filter.setToolTip("Filter by Function Block number found in the loaded results")
+        self.scope_mode = QPushButton("Load all results")
+        self.scope_mode.setObjectName("scopeModeButton")
+        self.scope_mode.setCheckable(True)
+        self.scope_mode.setEnabled(False)
+        self.scope_mode.setToolTip(
+            "When enabled, only result files whose test IDs are selected in the loaded "
+            "test_scope.xml are visible. When disabled, every XML in the Results folder is "
+            "visible, including tests that were executed and later removed from the scope."
+        )
         self.filter_badge = QPushButton("●  FILTER ACTIVE — CLEAR")
         self.filter_badge.setObjectName("activeFilterBadge")
         self.filter_badge.setToolTip("A search, status, or Function Block filter is active. Click to clear all filters.")
@@ -2020,10 +1966,12 @@ class Dashboard(QWidget):
         self.search.textChanged.connect(self._filters_changed)
         self.status_filter.currentIndexChanged.connect(self._filters_changed)
         self.number_filter.currentIndexChanged.connect(self._filters_changed)
+        self.scope_mode.toggled.connect(self._scope_mode_changed)
         self.visible_label = QLabel("0 results"); self.visible_label.setObjectName("muted")
         controls.addWidget(self.search, 1)
         controls.addWidget(self.status_filter)
         controls.addWidget(self.number_filter)
+        controls.addWidget(self.scope_mode)
         controls.addWidget(self.filter_badge)
         controls.addWidget(self.visible_label)
         tp.addLayout(controls)
@@ -2161,6 +2109,7 @@ class Dashboard(QWidget):
         self.proxy.set_query(self.search.text())
         self.proxy.set_status(self.status_filter.currentData())
         self.proxy.set_function_block(self.number_filter.currentData())
+        self.proxy.set_scope_ids(self._scope_ids if self.scope_mode.isChecked() else None)
         active = (
             bool(self.search.text().strip())
             or self.status_filter.currentData() != "all"
@@ -2172,6 +2121,39 @@ class Dashboard(QWidget):
         elif not active:
             self.filter_animation.stop()
             self.filter_opacity.setOpacity(1.0)
+
+    def _scope_mode_changed(self, checked: bool):
+        self.scope_mode.setText("Load scope results" if checked else "Load all results")
+        self.proxy.set_scope_ids(self._scope_ids if checked else None)
+        self._update_result_summary(self._records_for_current_mode())
+        self._update_visible()
+
+    def _records_for_current_mode(self) -> list[TestRecord]:
+        if self.scope_mode.isChecked():
+            return [record for record in self._records if record.test_id in self._scope_ids]
+        return self._records
+
+    def _update_result_summary(self, records: list[TestRecord]):
+        counts = {status: sum(record.status == status for record in records) for status in STATUS_META}
+        total = len(records)
+        for status, card in self.cards.items():
+            card.set_value(counts[status], total)
+        self.chart.set_counts(counts)
+        while self.legend.count():
+            item = self.legend.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for status in STATUS_META:
+            if not counts[status]:
+                continue
+            label, color, _ = STATUS_META[status]
+            pct = counts[status] * 100 / total if total else 0
+            row = QLabel(
+                f"<span style='color:{color};font-size:14px'>●</span>  {label} &nbsp; "
+                f"<b>{counts[status]}</b> · {pct:.1f}%"
+            )
+            row.setObjectName("distributionLegend")
+            self.legend.addWidget(row)
 
     def _clear_filters(self):
         self.search.clear()
@@ -2248,31 +2230,30 @@ class Dashboard(QWidget):
         scope_file: Path | None = None,
         scope_groups: list[ScopeGroup] | None = None,
     ):
+        self._records = records
+        groups = (scope_groups or empty_scope_groups()) if scope_file else empty_scope_groups()
+        self._scope_ids = {
+            test_id for group in groups for test_id in group.test_ids
+        } if scope_file else set()
+        scope_was_available = self.scope_mode.isEnabled()
+        blocker = QSignalBlocker(self.scope_mode)
+        self.scope_mode.setEnabled(bool(scope_file))
+        if not scope_file:
+            self.scope_mode.setChecked(False)
+        elif not scope_was_available:
+            self.scope_mode.setChecked(True)
+        del blocker
+        self._scope_mode_changed(self.scope_mode.isChecked())
         self._update_number_filter(records)
         if folder:
             source_kind = "Single XML" if folder.is_file() else "Results folder"
             self.folder_label.setText(f"{source_kind}: {folder}")
         else:
             self.folder_label.setText("No result source selected")
-        counts = {status: sum(r.status == status for r in records) for status in STATUS_META}
-        total = len(records)
-        for status, card in self.cards.items(): card.set_value(counts[status], total)
-        self.chart.set_counts(counts)
-        while self.legend.count():
-            item = self.legend.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
-        for status in STATUS_META:
-            if not counts[status]: continue
-            label, color, _ = STATUS_META[status]
-            pct = counts[status] * 100 / total if total else 0
-            row = QLabel(f"<span style='color:{color};font-size:14px'>●</span>  {label} &nbsp; <b>{counts[status]}</b> · {pct:.1f}%")
-            row.setObjectName("distributionLegend")
-            self.legend.addWidget(row)
         while self.clusters_grid.count():
             item = self.clusters_grid.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        groups = (scope_groups or empty_scope_groups()) if scope_file else empty_scope_groups()
         cluster_cards: list[ClusterCard] = []
         column_count = 7
         row_count = max(1, (len(groups) + column_count - 1) // column_count)
@@ -2342,7 +2323,7 @@ class Dashboard(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Tridonic One4All Viewer — Version 1.4")
+        self.setWindowTitle("Tridonic One4All Viewer — Version 1.6")
         self.resize(1440, 900); self.setMinimumSize(1200, 760)
         self.qa_store = QAMemberStore()
         self.model = ResultsModel(self.qa_store); self.proxy = ResultsProxy(); self.proxy.setSourceModel(self.model)
@@ -2382,7 +2363,7 @@ class MainWindow(QMainWindow):
         self._scope_job_silent = False
         self._network_activity_count = 0
         self._scan_cache: dict[str, tuple[int, int, TestRecord]] = {}
-        version_label = QLabel("VERSION 1.4")
+        version_label = QLabel("VERSION 1.6")
         version_label.setObjectName("footerMeta")
         powered_label = QLabel("POWERED BY PT TEAM")
         powered_label.setObjectName("footerBrand")
@@ -2527,7 +2508,7 @@ class MainWindow(QMainWindow):
         self.scope_file = loaded_path
         self.scope_groups = groups
         self.qa_store.set_loaded_data(
-            loaded_path.parent / QA_DATA_FILE_NAME, members, assignments, warning
+            loaded_path.parent / RELATIONSHIPS_DATA_FILE_NAME, members, assignments, warning
         )
         if self.model.records:
             self.model.set_records(list(self.model.records))
@@ -2851,6 +2832,9 @@ QPushButton { background: #3974D8; color: white; border: 0; border-radius: 8px; 
 QPushButton:hover { background: #2E63BD; }
 QPushButton#secondaryButton { background: #EAF1FC; color: #2E63BD; }
 QPushButton#secondaryButton:disabled { background: #E2E5EA; color: #9AA3B1; border: 1px solid #D4D9E1; }
+QPushButton#scopeModeButton { background: #EEF1F6; color: #53627A; border: 1px solid #D4DCE8; }
+QPushButton#scopeModeButton:checked { background: #E7F5EE; color: #39785F; border: 1px solid #8EC5AE; }
+QPushButton#scopeModeButton:disabled { background: #F1F3F6; color: #A0A8B5; border: 1px solid #E0E4EA; }
 QPushButton#reportButton { background: #4F9A7D; color: white; }
 QPushButton#reportButton:hover { background: #43866D; }
 QPushButton#reportButton:disabled { background: #A9CDBF; color: #F3FAF7; }
@@ -2893,7 +2877,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Tridonic One4All Viewer")
     app.setApplicationDisplayName("Tridonic One4All Viewer")
-    app.setApplicationVersion("1.4")
+    app.setApplicationVersion("1.6")
     icon_path = APP_DIR / "app_icon.ico"
     if icon_path.is_file():
         app.setWindowIcon(QIcon(str(icon_path)))

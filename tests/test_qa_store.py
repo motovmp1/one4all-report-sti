@@ -24,6 +24,7 @@ from main import (
     ResultsModel,
     ResultsProxy,
     ScanJob,
+    ScopeGroup,
     ScopeLoadJob,
     TestRecord,
     is_network_path,
@@ -39,12 +40,14 @@ class QAMemberStoreTests(unittest.TestCase):
     def setUp(self):
         self.folder = Path(__file__).parent / f".qa_store_{self._testMethodName}"
         self.folder.mkdir()
-        self.data_file = self.folder / "One4All_QA_data.xml"
+        self.data_file = self.folder / "Relationships.xml"
         self.result = self.folder / "30.4 result.xml"
-        self.legacy_file = self.folder / "Test_report_data.xml"
+        self.legacy_file = self.data_file
+        self.obsolete_qa_file = self.folder / "One4All_QA_data.xml"
+        self.obsolete_report_file = self.folder / "Test_report_data.xml"
         self.legacy_file.write_text(
             '<Tests legacy="yes"><Test Number="30.4" Duration="0" BugIDs="" '
-            'BugIDsFI="" DID="" Tester="" Comment="legacy comment">'
+            'BugIDsFI="" DID="" Tester="WB" Comment="legacy comment">'
             '<Index>0</Index><Name>30.4 result.xml</Name></Test></Tests>',
             encoding="utf-8",
         )
@@ -52,45 +55,62 @@ class QAMemberStoreTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.folder)
 
-    def test_adding_a_qa_member_does_not_touch_legacy_comments(self):
+    def test_relationships_is_the_only_source_for_qa_and_comments(self):
+        self.obsolete_qa_file.write_text(
+            '<One4AllQAData><QAMembers><Member id="QA001" name="Wrong QA"/>'
+            '</QAMembers></One4AllQAData>',
+            encoding="utf-8",
+        )
+        self.obsolete_report_file.write_text(
+            '<Tests><Test Number="30.4" Tester="WRONG" Comment="wrong comment">'
+            '<Name>30.4 result.xml</Name></Test></Tests>',
+            encoding="utf-8",
+        )
+        obsolete_qa_before = self.obsolete_qa_file.read_bytes()
+        obsolete_report_before = self.obsolete_report_file.read_bytes()
         store = QAMemberStore()
         self.assertEqual(store.members, [])
         store.set_data_file(self.data_file)
-        self.assertFalse(self.data_file.exists())
-        legacy_before = self.legacy_file.read_bytes()
+        relationships_before = self.legacy_file.read_bytes()
+        self.assertEqual([member.name for member in store.members], ["WB"])
 
         member = store.add_member("Alice QA")
-        self.assertEqual(member.member_id, "QA001")
-        self.assertTrue(self.data_file.exists())
-        self.assertEqual(self.legacy_file.read_bytes(), legacy_before)
-        self.assertEqual(store.assignment_for(self.result).qa_comment, "legacy comment")
+        self.assertEqual(member.member_id, "Alice QA")
+        self.assertEqual(self.legacy_file.read_bytes(), relationships_before)
+        self.assertEqual(self.obsolete_qa_file.read_bytes(), obsolete_qa_before)
+        self.assertEqual(self.obsolete_report_file.read_bytes(), obsolete_report_before)
+        self.assertEqual(
+            store.assignment_for(self.result), QAAssignment("WB", "legacy comment")
+        )
 
-    def test_member_is_saved_in_qa_xml_and_comment_in_legacy_xml(self):
+    def test_member_and_comment_are_saved_in_relationships(self):
         store = QAMemberStore()
         store.set_data_file(self.data_file)
-        member = store.add_member("Alice QA")
 
         store.assign_comment(self.result, "first comment")
-        self.assertEqual(store.assignment_for(self.result).member_id, "")
+        self.assertEqual(store.assignment_for(self.result).member_id, "WB")
+        member = store.add_member("Alice QA")
         store.assign_member(self.result, member.member_id)
         self.assertEqual(
-            store.assignment_for(self.result), QAAssignment("QA001", "first comment")
+            store.assignment_for(self.result), QAAssignment("Alice QA", "first comment")
         )
         store.assign_comment(self.result, "changed comment")
         self.assertEqual(
-            store.assignment_for(self.result), QAAssignment("QA001", "changed comment")
+            store.assignment_for(self.result), QAAssignment("Alice QA", "changed comment")
         )
 
         reloaded = QAMemberStore()
         reloaded.set_data_file(self.data_file)
         self.assertEqual(reloaded.members[0].name, "Alice QA")
         self.assertEqual(
-            reloaded.assignment_for(self.result), QAAssignment("QA001", "changed comment")
+            reloaded.assignment_for(self.result), QAAssignment("Alice QA", "changed comment")
         )
         legacy_test = ET.parse(self.legacy_file).getroot().find("./Test")
         self.assertEqual(legacy_test.get("Comment"), "changed comment")
-        qa_test = ET.parse(self.data_file).getroot().find("./Tests/Test")
-        self.assertIsNone(qa_test.find("Comment"))
+        self.assertEqual(legacy_test.get("Tester"), "Alice QA")
+        self.assertEqual(legacy_test.get("Duration"), "0")
+        self.assertEqual(ET.parse(self.legacy_file).getroot().get("legacy"), "yes")
+        self.assertFalse(self.obsolete_qa_file.exists())
 
     def test_comment_entry_is_created_dynamically_when_result_is_missing(self):
         other_result = self.folder / "31.2 new result.xml"
@@ -105,7 +125,7 @@ class QAMemberStoreTests(unittest.TestCase):
         self.assertEqual(created.get("Comment"), "new shared comment")
         self.assertEqual(store.assignment_for(other_result).qa_comment, "new shared comment")
 
-    def test_unique_legacy_number_matches_an_abbreviated_name(self):
+    def test_unique_relationship_number_matches_an_abbreviated_name(self):
         self.legacy_file.write_text(
             '<Tests><Test Number="30.4" Comment="shared abbreviated comment">'
             '<Index>0</Index><Name>30.4 abbreviated legacy name</Name>'
@@ -157,7 +177,7 @@ class QAMemberStoreTests(unittest.TestCase):
         self.assertTrue(page.comments_editor.isHidden())
         page.qa_combo.setCurrentIndex(0)
         page._cancel_member_edit()
-        self.assertEqual(record.qa_member_id, "QA001")
+        self.assertEqual(record.qa_member_id, "Alice QA")
 
         page._start_comment_edit()
         self.assertTrue(page.qa_combo.isHidden())
@@ -210,12 +230,13 @@ class QAMemberStoreTests(unittest.TestCase):
         page._start_member_edit()
         page._remove_member_assignment()
         self.assertEqual(store.assignment_for(self.result), QAAssignment("", long_comment))
+        member = store.add_member("Alice QA")
         store.assign_member(self.result, member.member_id)
         record.qa_member_id = member.member_id
         record.qa_member_name = member.name
         page._start_comment_edit()
         page._remove_comment()
-        self.assertEqual(store.assignment_for(self.result), QAAssignment("QA001", ""))
+        self.assertEqual(store.assignment_for(self.result), QAAssignment("Alice QA", ""))
         page.close()
 
     def test_report_lists_only_qa_members_assigned_to_scoped_results(self):
@@ -253,8 +274,8 @@ class QAMemberStoreTests(unittest.TestCase):
         )
         store = QAMemberStore()
         store.set_data_file(self.data_file)
-        store.add_member("Alice QA")
-        store.assign_member(self.result, "QA001")
+        member = store.add_member("Alice QA")
+        store.assign_member(self.result, member.member_id)
         finished = []
         job = ScopeLoadJob(scope)
         job.signals.finished.connect(lambda payload, error, path: finished.append((payload, error, path)))
@@ -267,7 +288,7 @@ class QAMemberStoreTests(unittest.TestCase):
         groups, members, assignments, warning = payload
         self.assertEqual(next(group for group in groups if group.folder_id == "30").test_ids, {"30.4"})
         self.assertEqual(members[0].name, "Alice QA")
-        self.assertEqual(assignments[self.result.name.casefold()].member_id, "QA001")
+        self.assertEqual(assignments[self.result.name.casefold()].member_id, "Alice QA")
         self.assertEqual(warning, "")
 
     def test_qa_save_runs_asynchronously_with_production_pool(self):
@@ -417,6 +438,31 @@ class QAMemberStoreTests(unittest.TestCase):
         dashboard.search.setText("recovery")
         self.assertEqual(proxy.rowCount(), 0)
         dashboard._clear_filters()
+        self.assertEqual(proxy.rowCount(), 3)
+
+        scope = self.folder / "test_scope.xml"
+        scope.write_text("<Tests/>", encoding="utf-8")
+        dashboard.update_data(
+            self.folder,
+            records,
+            scope,
+            [ScopeGroup("21_LCS", "21", {"21.2"})],
+        )
+        self.assertTrue(dashboard.scope_mode.isEnabled())
+        self.assertTrue(dashboard.scope_mode.isChecked())
+        self.assertEqual(dashboard.scope_mode.text(), "Load scope results")
+        self.assertEqual(proxy.rowCount(), 1)
+        self.assertEqual(dashboard.cards["failed"].value.text(), "1")
+        self.assertIn("later removed from the scope", dashboard.scope_mode.toolTip())
+
+        dashboard.scope_mode.setChecked(False)
+        self.assertEqual(dashboard.scope_mode.text(), "Load all results")
+        self.assertEqual(proxy.rowCount(), 3)
+        self.assertEqual(dashboard.cards["passed"].value.text(), "2")
+
+        dashboard.update_data(self.folder, records)
+        self.assertFalse(dashboard.scope_mode.isEnabled())
+        self.assertFalse(dashboard.scope_mode.isChecked())
         self.assertEqual(proxy.rowCount(), 3)
         dashboard.deleteLater()
 
