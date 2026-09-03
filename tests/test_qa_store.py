@@ -43,50 +43,49 @@ class QAMemberStoreTests(unittest.TestCase):
     def setUp(self):
         self.folder = Path(__file__).parent / f".qa_store_{self._testMethodName}"
         self.folder.mkdir()
-        self.data_file = self.folder / "Relationships.xml"
+        self.data_file = self.folder / "Test_report_data.xml"
+        self.relationships_file = self.folder / "Relationships.xml"
         self.result = self.folder / "30.4 result.xml"
-        self.legacy_file = self.data_file
+        self.legacy_file = self.relationships_file
         self.obsolete_qa_file = self.folder / "One4All_QA_data.xml"
-        self.obsolete_report_file = self.folder / "Test_report_data.xml"
-        self.legacy_file.write_text(
+        initial = (
             '<Tests legacy="yes"><Test Number="30.4" Duration="0" BugIDs="" '
             'BugIDsFI="" DID="" Tester="WB" Comment="legacy comment">'
-            '<Index>0</Index><Name>30.4 result.xml</Name></Test></Tests>',
-            encoding="utf-8",
+            '<Index>0</Index><Name>30.4 result.xml</Name></Test></Tests>'
         )
+        self.data_file.write_text(initial, encoding="utf-8")
+        self.relationships_file.write_text(initial, encoding="utf-8")
 
     def tearDown(self):
         shutil.rmtree(self.folder)
 
-    def test_relationships_is_the_only_source_for_qa_and_comments(self):
+    def test_report_data_is_the_primary_source_for_qa_and_comments(self):
         self.obsolete_qa_file.write_text(
             '<One4AllQAData><QAMembers><Member id="QA001" name="Wrong QA"/>'
             '</QAMembers></One4AllQAData>',
             encoding="utf-8",
         )
-        self.obsolete_report_file.write_text(
+        self.relationships_file.write_text(
             '<Tests><Test Number="30.4" Tester="WRONG" Comment="wrong comment">'
-            '<Name>30.4 result.xml</Name></Test></Tests>',
+            '<Index>0</Index><Name>30.4 result.xml</Name></Test></Tests>',
             encoding="utf-8",
         )
         obsolete_qa_before = self.obsolete_qa_file.read_bytes()
-        obsolete_report_before = self.obsolete_report_file.read_bytes()
+        relationships_before = self.relationships_file.read_bytes()
         store = QAMemberStore()
         self.assertEqual(store.members, [])
         store.set_data_file(self.data_file)
-        relationships_before = self.legacy_file.read_bytes()
         self.assertEqual([member.name for member in store.members], ["WB"])
 
         member = store.add_member("Alice QA")
         self.assertEqual(member.member_id, "Alice QA")
-        self.assertEqual(self.legacy_file.read_bytes(), relationships_before)
+        self.assertEqual(self.relationships_file.read_bytes(), relationships_before)
         self.assertEqual(self.obsolete_qa_file.read_bytes(), obsolete_qa_before)
-        self.assertEqual(self.obsolete_report_file.read_bytes(), obsolete_report_before)
         self.assertEqual(
             store.assignment_for(self.result), QAAssignment("WB", "legacy comment")
         )
 
-    def test_member_and_comment_are_saved_in_relationships(self):
+    def test_member_and_comment_are_saved_in_both_legacy_files(self):
         store = QAMemberStore()
         store.set_data_file(self.data_file)
 
@@ -108,17 +107,39 @@ class QAMemberStoreTests(unittest.TestCase):
         self.assertEqual(
             reloaded.assignment_for(self.result), QAAssignment("Alice QA", "changed comment")
         )
-        legacy_test = ET.parse(self.legacy_file).getroot().find("./Test")
-        self.assertEqual(legacy_test.get("Comment"), "changed comment")
-        self.assertEqual(legacy_test.get("Tester"), "Alice QA")
-        self.assertEqual(legacy_test.get("Duration"), "0")
-        self.assertEqual(ET.parse(self.legacy_file).getroot().get("legacy"), "yes")
+        for legacy_path in (self.data_file, self.relationships_file):
+            legacy_test = ET.parse(legacy_path).getroot().find("./Test")
+            self.assertEqual(legacy_test.get("Comment"), "changed comment")
+            self.assertEqual(legacy_test.get("Tester"), "Alice QA")
+            self.assertEqual(legacy_test.get("Duration"), "0")
+            self.assertEqual(ET.parse(legacy_path).getroot().get("legacy"), "yes")
+            self.assertFalse(legacy_path.read_bytes().lstrip().startswith(b"<?xml"))
         self.assertFalse(self.obsolete_qa_file.exists())
 
-    def test_locked_relationships_file_is_never_replaced(self):
+    def test_dual_save_preserves_each_files_duration(self):
+        report_tree = ET.parse(self.data_file)
+        report_tree.getroot().find("./Test").set("Duration", "81")
+        report_tree.write(self.data_file, encoding="utf-8")
+        relationships_tree = ET.parse(self.relationships_file)
+        relationships_tree.getroot().find("./Test").set("Duration", "5")
+        relationships_tree.write(self.relationships_file, encoding="utf-8")
         store = QAMemberStore()
         store.set_data_file(self.data_file)
-        original = self.legacy_file.read_bytes()
+
+        store.assign_comment(self.result, "same QA comment")
+
+        report = ET.parse(self.data_file).getroot().find("./Test")
+        relationship = ET.parse(self.relationships_file).getroot().find("./Test")
+        self.assertEqual(report.get("Comment"), "same QA comment")
+        self.assertEqual(relationship.get("Comment"), "same QA comment")
+        self.assertEqual(report.get("Duration"), "81")
+        self.assertEqual(relationship.get("Duration"), "5")
+
+    def test_locked_relationships_file_leaves_both_files_unchanged(self):
+        store = QAMemberStore()
+        store.set_data_file(self.data_file)
+        report_original = self.data_file.read_bytes()
+        relationships_original = self.relationships_file.read_bytes()
         locked_error = OSError(
             "Relationships.xml is in use by another application. "
             "The QA change was not saved."
@@ -126,25 +147,28 @@ class QAMemberStoreTests(unittest.TestCase):
 
         with patch.object(
             store,
-            "_assert_data_file_available",
+            "_assert_path_available",
             side_effect=[None, locked_error],
         ):
             with self.assertRaisesRegex(OSError, "in use by another application"):
                 store.assign_comment(self.result, "must not be written")
 
-        self.assertEqual(self.legacy_file.read_bytes(), original)
+        self.assertEqual(self.data_file.read_bytes(), report_original)
+        self.assertEqual(self.relationships_file.read_bytes(), relationships_original)
         self.assertEqual(list(self.folder.glob(".Relationships.xml.*.tmp")), [])
+        self.assertEqual(list(self.folder.glob(".Test_report_data.xml.*.tmp")), [])
 
     @unittest.skipUnless(os.name == "nt", "Windows file-sharing semantics")
     def test_windows_open_file_is_reported_as_in_use(self):
         store = QAMemberStore()
         store.set_data_file(self.data_file)
-        original = self.legacy_file.read_bytes()
+        report_original = self.data_file.read_bytes()
+        relationships_original = self.relationships_file.read_bytes()
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         create_file = kernel32.CreateFileW
         create_file.restype = ctypes.c_void_p
         handle = create_file(
-            os.fspath(self.legacy_file),
+            os.fspath(self.relationships_file),
             0x80000000,
             0,
             None,
@@ -159,7 +183,8 @@ class QAMemberStoreTests(unittest.TestCase):
         finally:
             kernel32.CloseHandle(ctypes.c_void_p(handle))
 
-        self.assertEqual(self.legacy_file.read_bytes(), original)
+        self.assertEqual(self.data_file.read_bytes(), report_original)
+        self.assertEqual(self.relationships_file.read_bytes(), relationships_original)
 
     def test_comment_preview_uses_three_lines_and_continuation_arrow(self):
         preview = comment_table_preview(
@@ -184,11 +209,14 @@ class QAMemberStoreTests(unittest.TestCase):
 
         store.assign_comment(other_result, "new shared comment")
 
-        tests = ET.parse(self.legacy_file).getroot().findall("./Test")
+        tests = ET.parse(self.data_file).getroot().findall("./Test")
         created = next(item for item in tests if item.findtext("Name") == other_result.name)
         self.assertEqual(created.get("Number"), "31.2")
         self.assertEqual(created.get("Comment"), "new shared comment")
         self.assertEqual(store.assignment_for(other_result).qa_comment, "new shared comment")
+        self.assertEqual(
+            len(ET.parse(self.relationships_file).getroot().findall("./Test")), 1
+        )
 
     def test_comment_line_breaks_round_trip_through_relationships(self):
         store = QAMemberStore()
@@ -198,11 +226,12 @@ class QAMemberStoreTests(unittest.TestCase):
         store.assign_comment(self.result, multiline)
 
         self.assertEqual(store.assignment_for(self.result).qa_comment, multiline)
-        saved = ET.parse(self.legacy_file).getroot().find("./Test")
-        self.assertEqual(saved.get("Comment"), multiline)
+        for legacy_path in (self.data_file, self.relationships_file):
+            saved = ET.parse(legacy_path).getroot().find("./Test")
+            self.assertEqual(saved.get("Comment"), multiline)
 
     def test_unique_relationship_number_matches_an_abbreviated_name(self):
-        self.legacy_file.write_text(
+        self.data_file.write_text(
             '<Tests><Test Number="30.4" Comment="shared abbreviated comment">'
             '<Index>0</Index><Name>30.4 abbreviated legacy name</Name>'
             '</Test></Tests>',
@@ -214,6 +243,48 @@ class QAMemberStoreTests(unittest.TestCase):
         self.assertEqual(
             store.assignment_for(self.result).qa_comment,
             "shared abbreviated comment",
+        )
+
+    def test_duplicate_test_numbers_are_matched_by_legacy_scope_index(self):
+        scope = self.folder / "test_scope.xml"
+        scope.write_text(
+            '<Tests>'
+            '<Test Number="4.13"><Index>37</Index>'
+            '<Name>Z:\\ST-I_SDB\\04_DC-EM\\4.13 DC switching basic test_polarity 1.vdx</Name>'
+            '</Test>'
+            '<Test Number="4.13"><Index>38</Index>'
+            '<Name>Z:\\ST-I_SDB\\04_DC-EM\\4.13 DC switching basic test_polarity 2.vdx</Name>'
+            '</Test>'
+            '</Tests>',
+            encoding="utf-8",
+        )
+        duplicate_xml = (
+            '<Tests>'
+            '<Test Number="4.13" Tester="QA1" Comment="first">'
+            '<Index>37</Index><Name>4.13 DC switching basic test_polarity 1_new run.xml</Name>'
+            '</Test>'
+            '<Test Number="4.13" Tester="QA2" Comment="second">'
+            '<Index>38</Index><Name>4.13 DC switching basic test_polarity 2_new run.xml</Name>'
+            '</Test>'
+            '</Tests>'
+        )
+        self.data_file.write_text(duplicate_xml, encoding="utf-8")
+        self.relationships_file.write_text(duplicate_xml, encoding="utf-8")
+        older_result = self.folder / "4.13 DC switching basic test_polarity 2_old run.xml"
+        store = QAMemberStore()
+        store.set_data_file(self.legacy_file)
+
+        self.assertEqual(store.assignment_for(older_result), QAAssignment("QA2", "second"))
+        store.assign_comment(older_result, "updated by new viewer")
+
+        saved_tests = ET.parse(self.data_file).getroot().findall("./Test")
+        self.assertEqual(len(saved_tests), 2)
+        self.assertEqual(saved_tests[0].get("Comment"), "first")
+        self.assertEqual(saved_tests[1].get("Comment"), "updated by new viewer")
+        self.assertEqual(saved_tests[1].findtext("Index"), "38")
+        self.assertEqual(
+            saved_tests[1].findtext("Name"),
+            "4.13 DC switching basic test_polarity 2_new run.xml",
         )
 
     def test_clearing_scope_clears_loaded_qa_data(self):
@@ -361,11 +432,12 @@ class QAMemberStoreTests(unittest.TestCase):
         self.assertEqual(len(finished), 1)
         payload, error, loaded_path = finished[0]
         self.assertEqual(error, "")
-        groups, members, assignments, warning = payload
+        groups, members, assignments, warning, scope_entries = payload
         self.assertEqual(next(group for group in groups if group.folder_id == "30").test_ids, {"30.4"})
         self.assertEqual(members[0].name, "Alice QA")
         self.assertEqual(assignments[self.result.name.casefold()].member_id, "Alice QA")
         self.assertEqual(warning, "")
+        self.assertEqual(scope_entries, [])
 
     def test_qa_save_runs_asynchronously_with_production_pool(self):
         store = QAMemberStore()
@@ -440,17 +512,61 @@ class QAMemberStoreTests(unittest.TestCase):
 
         results = Path(__file__).parents[1] / "ST-I_Results"
         window.set_folder(results)
-        self.assertTrue(window.scanning)
+        self.assertTrue(window.scanning or window._scope_job is not None)
         self.assertFalse(window.dashboard.choose_scope_button.isEnabled())
+        active_scope_job = window._scope_job
         window.set_scope_file(scope)
-        self.assertIsNone(window._scope_job)
+        self.assertIs(window._scope_job, active_scope_job)
         deadline = time.monotonic() + 10
-        while window.scanning and time.monotonic() < deadline:
+        while (window.scanning or window._scope_job is not None) and time.monotonic() < deadline:
             self.app.processEvents()
             time.sleep(0.01)
         self.assertFalse(window.scanning)
         self.assertTrue(window.dashboard.choose_scope_button.isEnabled())
         self.assertGreater(len(window.model.records), 0)
+        window.close()
+
+    def test_refresh_reloads_external_relationship_changes(self):
+        results = self.folder / "results"
+        results.mkdir()
+        result = results / "30.4 result.xml"
+        result.write_text(
+            '<XML filestart="01-09-26_10h-00min-00s">'
+            '<TEST><DATA name="DUT" value="DUT A"/></TEST>'
+            '<DATA filestop="01-09-26_10h-01min-00s"/></XML>',
+            encoding="utf-8",
+        )
+        scope = self.folder / "test_scope.xml"
+        scope.write_text(
+            '<Tests><Test Number="30.4"><Name>30.4 result.xml</Name></Test></Tests>',
+            encoding="utf-8",
+        )
+        window = MainWindow()
+        window.set_scope_file(scope)
+        deadline = time.monotonic() + 5
+        while window._scope_job is not None and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        window.set_folder(results)
+        deadline = time.monotonic() + 5
+        while (window._scope_job is not None or window.scanning) and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+
+        self.assertEqual(window.model.records[0].qa_comment, "legacy comment")
+        self.assertIn(str(self.data_file.absolute()), window.watcher.files())
+        self.assertIn(str(self.relationships_file.absolute()), window.watcher.files())
+        tree = ET.parse(self.data_file)
+        tree.getroot().find("./Test").set("Comment", "changed in legacy")
+        tree.write(self.data_file, encoding="utf-8")
+
+        window.refresh()
+        deadline = time.monotonic() + 5
+        while (window._scope_job is not None or window.scanning) and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+
+        self.assertEqual(window.model.records[0].qa_comment, "changed in legacy")
         window.close()
 
     def test_dynamic_function_block_filter_combines_with_status_and_search(self):

@@ -41,6 +41,7 @@ PALE_BLUE = HexColor("#EDF4FF")
 PALE_GREEN = HexColor("#EDF8F3")
 PALE_RED = HexColor("#FCEFF1")
 PALE_AMBER = HexColor("#FFF6E7")
+REPORT_DATA_FILE_NAME = "Test_report_data.xml"
 RELATIONSHIPS_DATA_FILE_NAME = "Relationships.xml"
 ProgressCallback = Callable[[int, str], None]
 
@@ -191,11 +192,13 @@ def load_campaign_info(scope_path: Path) -> dict[str, str]:
 
 def load_qa_member_names(scope_path: Path, scoped: dict[str, Result]) -> list[str]:
     """Return QA members assigned to the latest scoped results."""
-    relationships_path = scope_path.parent / RELATIONSHIPS_DATA_FILE_NAME
-    if not relationships_path.is_file():
+    report_data_path = scope_path.parent / REPORT_DATA_FILE_NAME
+    if not report_data_path.is_file():
+        report_data_path = scope_path.parent / RELATIONSHIPS_DATA_FILE_NAME
+    if not report_data_path.is_file():
         return []
     try:
-        root = ET.parse(relationships_path).getroot()
+        root = ET.parse(report_data_path).getroot()
     except (OSError, ET.ParseError):
         return []
     current_results = {result.path.name.casefold() for result in scoped.values()}

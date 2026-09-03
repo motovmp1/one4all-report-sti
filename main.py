@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import html
+import io
 import os
 import re
 import sys
@@ -80,6 +81,7 @@ APP_DIR = (
     else Path(__file__).resolve().parent
 )
 RELATIONSHIPS_DATA_FILE_NAME = "Relationships.xml"
+REPORT_DATA_FILE_NAME = "Test_report_data.xml"
 
 
 def normalized_path(path: Path) -> Path:
@@ -129,16 +131,33 @@ class QAMemberStore:
     def __init__(self):
         self.members: list[QAMember] = []
         self.assignments: dict[str, QAAssignment] = {}
+        self.scope_entries: list[tuple[str, str, str]] = []
         self.data_file: Path | None = None
+        self.relationships_file: Path | None = None
         self.warning = ""
 
     def reload(self):
         self.members = []
         self.assignments = {}
+        self.scope_entries = []
         self.warning = ""
         path = self.data_file
         if not path:
             return
+        scope_path = path.parent / "test_scope.xml"
+        if scope_path.is_file():
+            try:
+                scope_root = ET.parse(scope_path).getroot()
+                for element in scope_root.findall(".//Test"):
+                    number = (element.get("Number") or "").strip().casefold()
+                    index = (element.findtext("Index", default="") or "").strip()
+                    raw_name = (element.findtext("Name", default="") or "").strip()
+                    file_name = re.split(r"[\\/]", raw_name)[-1]
+                    stem = re.sub(r"\.[^.]+$", "", file_name).strip().casefold()
+                    if number and index and stem:
+                        self.scope_entries.append((number, index, stem))
+            except (OSError, ET.ParseError) as exc:
+                self.warning = f"test_scope.xml could not be read: {exc}"
         if not path.is_file():
             return
         try:
@@ -158,6 +177,9 @@ class QAMemberStore:
                     assignment = QAAssignment(tester, comment)
                     self.assignments[result_name.casefold()] = assignment
                     number = (element.get("Number") or "").strip().casefold()
+                    index = (element.findtext("Index", default="") or "").strip()
+                    if index:
+                        self.assignments[f"@index:{index}"] = assignment
                     if number:
                         by_number.setdefault(number, []).append(assignment)
             for number, assignments in by_number.items():
@@ -165,10 +187,26 @@ class QAMemberStore:
                     self.assignments[f"@test:{number}"] = assignments[0]
             self.members.sort(key=lambda member: member.name.casefold())
         except (OSError, ET.ParseError) as exc:
-            self.warning = f"{RELATIONSHIPS_DATA_FILE_NAME} could not be read: {exc}"
+            self.warning = f"{path.name} could not be read: {exc}"
 
     def set_data_file(self, path: Path | None):
-        self.data_file = normalized_path(path) if path else None
+        if path is None:
+            self.data_file = None
+            self.relationships_file = None
+        else:
+            selected = normalized_path(path)
+            relationships = selected.parent / RELATIONSHIPS_DATA_FILE_NAME
+            report = selected.parent / REPORT_DATA_FILE_NAME
+            self.relationships_file = relationships
+            # Keep compatibility with old folders that only contain
+            # Relationships.xml, but always prefer the file shown by the
+            # legacy Test Manager when it is available.
+            if report.is_file():
+                self.data_file = report
+            elif relationships.is_file():
+                self.data_file = relationships
+            else:
+                self.data_file = selected
         self.reload()
 
     def set_loaded_data(
@@ -177,15 +215,22 @@ class QAMemberStore:
         members: list[QAMember],
         assignments: dict[str, QAAssignment],
         warning: str = "",
+        scope_entries: list[tuple[str, str, str]] | None = None,
+        relationships_file: Path | None = None,
     ):
         self.data_file = normalized_path(path) if path else None
+        self.relationships_file = (
+            normalized_path(relationships_file)
+            if relationships_file
+            else (self.data_file.parent / RELATIONSHIPS_DATA_FILE_NAME if self.data_file else None)
+        )
         self.members = members
         self.assignments = assignments
+        self.scope_entries = list(scope_entries or [])
         self.warning = warning
 
-    def _assert_data_file_available(self):
-        """Fail before editing when Relationships.xml is open or unavailable."""
-        path = self.data_file
+    def _assert_path_available(self, path: Path | None):
+        """Fail before editing when a shared legacy XML is open or unavailable."""
         if path is None:
             raise OSError("Select the matching test_scope.xml before saving QA data.")
         if not path.is_file():
@@ -196,7 +241,7 @@ class QAMemberStore:
                     return
             except OSError as exc:
                 raise OSError(
-                    f"{RELATIONSHIPS_DATA_FILE_NAME} is not available for writing: {exc}"
+                    f"{path.name} is not available for writing: {exc}"
                 ) from exc
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -228,14 +273,17 @@ class QAMemberStore:
             error_code = ctypes.get_last_error()
             if error_code in (32, 33):  # sharing or lock violation
                 raise OSError(
-                    f"{RELATIONSHIPS_DATA_FILE_NAME} is in use by another application. "
+                    f"{path.name} is in use by another application. "
                     "The QA change was not saved."
                 )
             raise OSError(
-                f"{RELATIONSHIPS_DATA_FILE_NAME} is not available for writing "
+                f"{path.name} is not available for writing "
                 f"(Windows error {error_code}). The QA change was not saved."
             )
         close_handle(handle)
+
+    def _assert_data_file_available(self):
+        self._assert_path_available(self.data_file)
 
     def _load_or_create_tree(self) -> tuple[ET.ElementTree, ET.Element]:
         path = self.data_file
@@ -245,50 +293,75 @@ class QAMemberStore:
             try:
                 tree = ET.parse(path)
             except ET.ParseError as exc:
-                raise OSError(f"{RELATIONSHIPS_DATA_FILE_NAME} is not valid XML: {exc}") from exc
+                raise OSError(f"{path.name} is not valid XML: {exc}") from exc
             root = tree.getroot()
             if root.tag != "Tests":
-                raise OSError(f"{RELATIONSHIPS_DATA_FILE_NAME} has an unsupported root element.")
+                raise OSError(f"{path.name} has an unsupported root element.")
         else:
             root = ET.Element("Tests")
             tree = ET.ElementTree(root)
         return tree, root
 
-    def _write_tree(self, tree: ET.ElementTree):
-        path = self.data_file
-        if path is None:
-            raise OSError("Select the matching test_scope.xml before saving QA data.")
-        path.parent.mkdir(parents=True, exist_ok=True)
+    @staticmethod
+    def _tree_bytes(tree: ET.ElementTree, declaration: bool) -> bytes:
         ET.indent(tree, space="  ")
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        buffer = io.BytesIO()
+        tree.write(buffer, encoding="utf-8", xml_declaration=declaration)
+        return buffer.getvalue()
+
+    def _write_assignment_trees(self, trees: list[tuple[Path, ET.ElementTree]]):
+        """Validate both legacy files first, then update them as one QA operation."""
+        originals: dict[Path, bytes | None] = {}
+        temporaries: dict[Path, Path] = {}
+        replaced: list[Path] = []
         try:
-            tree.write(temporary, encoding="utf-8", xml_declaration=True)
-            ET.parse(temporary)  # never replace the shared file with invalid XML
-            self._assert_data_file_available()
-            temporary.replace(path)
-            ET.parse(path)  # confirm that the shared destination is readable
+            for path, tree in trees:
+                self._assert_path_available(path)
+                original = path.read_bytes() if path.is_file() else None
+                originals[path] = original
+                declaration = bool(original and original.lstrip().startswith(b"<?xml"))
+                temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+                temporary.write_bytes(self._tree_bytes(tree, declaration))
+                ET.parse(temporary)
+                temporaries[path] = temporary
+
+            # Recheck immediately before replacing either shared file.
+            for path, _tree in trees:
+                self._assert_path_available(path)
+            for path, _tree in trees:
+                temporaries[path].replace(path)
+                replaced.append(path)
+                ET.parse(path)
         except (OSError, ET.ParseError) as exc:
+            # Best-effort rollback prevents the two legacy files from being
+            # intentionally left with different QA values if the second save fails.
+            for path in reversed(replaced):
+                original = originals.get(path)
+                try:
+                    if original is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        rollback = path.with_name(f".{path.name}.{os.getpid()}.rollback.tmp")
+                        rollback.write_bytes(original)
+                        rollback.replace(path)
+                except OSError:
+                    pass
             if "change was not saved" in str(exc):
                 raise
-            if getattr(exc, "winerror", None) in (32, 33):
-                raise OSError(
-                    f"{RELATIONSHIPS_DATA_FILE_NAME} is in use by another application. "
-                    "The QA change was not saved."
-                ) from exc
+            names = " and ".join(path.name for path, _tree in trees)
             raise OSError(
-                f"{RELATIONSHIPS_DATA_FILE_NAME} could not be saved. "
-                f"The QA change was not saved: {exc}"
+                f"{names} could not be saved. The QA change was not saved: {exc}"
             ) from exc
         finally:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
+            for temporary in temporaries.values():
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
         self.reload()
         if self.warning:
             raise OSError(
-                f"{RELATIONSHIPS_DATA_FILE_NAME} was written but could not be verified: "
-                f"{self.warning}"
+                f"The QA data was written but could not be verified: {self.warning}"
             )
 
     def add_member(self, name: str) -> QAMember:
@@ -318,14 +391,31 @@ class QAMemberStore:
         test_id_match = re.match(r"(\d+(?:\.\d+)*)", path.name)
         if not test_id_match:
             return QAAssignment()
+        scope_index = self._scope_index_for_result(path, test_id_match.group(1))
+        if scope_index:
+            indexed = self.assignments.get(f"@index:{scope_index}")
+            if indexed is not None:
+                return indexed
         return self.assignments.get(
             f"@test:{test_id_match.group(1).casefold()}", QAAssignment()
         )
 
+    def _scope_index_for_result(self, path: Path, test_id: str) -> str:
+        result_stem = path.stem.strip().casefold()
+        matches = [
+            index
+            for number, index, scope_stem in self.scope_entries
+            if number == test_id.casefold()
+            and (result_stem == scope_stem or result_stem.startswith(scope_stem + "_"))
+        ]
+        return matches[0] if len(matches) == 1 else ""
+
     def resolved_member(self, path: Path) -> QAMember | None:
         return self.member_by_id(self.assignment_for(path).member_id)
 
-    def _relationship_element(self, root: ET.Element, path: Path) -> ET.Element:
+    def _relationship_element(
+        self, root: ET.Element, path: Path, *, create: bool = True
+    ) -> ET.Element | None:
         wanted = path.name.casefold()
         element = next(
             (
@@ -338,6 +428,16 @@ class QAMemberStore:
         if element is None:
             test_id_match = re.match(r"(\d+(?:\.\d+)*)", path.name)
             test_id = test_id_match.group(1) if test_id_match else ""
+            scope_index = self._scope_index_for_result(path, test_id)
+            if scope_index:
+                element = next(
+                    (
+                        item
+                        for item in root.findall("./Test")
+                        if (item.findtext("Index", default="") or "").strip() == scope_index
+                    ),
+                    None,
+                )
             same_number = [
                 item
                 for item in root.findall("./Test")
@@ -345,8 +445,9 @@ class QAMemberStore:
             ]
             # A unique test number is a safe fallback when the legacy Name is
             # an older/short form. Multiple temperature variants are not.
-            element = same_number[0] if len(same_number) == 1 else None
-        if element is None:
+            if element is None:
+                element = same_number[0] if len(same_number) == 1 else None
+        if element is None and create:
             indices = []
             for item in root.findall("./Test/Index"):
                 try:
@@ -369,19 +470,46 @@ class QAMemberStore:
             ET.SubElement(element, "Name").text = path.name
         return element
 
+    def _assignment_trees(
+        self, path: Path, attribute: str, value: str
+    ) -> list[tuple[Path, ET.ElementTree]]:
+        primary_tree, primary_root = self._load_or_create_tree()
+        primary_element = self._relationship_element(primary_root, path)
+        assert primary_element is not None
+        primary_element.set(attribute, value)
+        trees = [(self.data_file, primary_tree)]
+
+        relationships = self.relationships_file
+        if relationships and relationships != self.data_file and relationships.is_file():
+            self._assert_path_available(relationships)
+            try:
+                relationship_tree = ET.parse(relationships)
+            except ET.ParseError as exc:
+                raise OSError(f"{relationships.name} is not valid XML: {exc}") from exc
+            relationship_root = relationship_tree.getroot()
+            if relationship_root.tag != "Tests":
+                raise OSError(f"{relationships.name} has an unsupported root element.")
+            relationship_element = self._relationship_element(
+                relationship_root, path, create=False
+            )
+            # Relationships.xml intentionally omits tests without a linked
+            # result. Never manufacture those records merely for QA metadata.
+            if relationship_element is not None:
+                relationship_element.set(attribute, value)
+                trees.append((relationships, relationship_tree))
+        return trees
+
     def assign_member(self, path: Path, member_id: str):
         self._assert_data_file_available()
-        tree, root = self._load_or_create_tree()
         member = self.member_by_id(member_id)
         tester = member.name if member else member_id.strip()
-        self._relationship_element(root, path).set("Tester", tester)
-        self._write_tree(tree)
+        self._write_assignment_trees(self._assignment_trees(path, "Tester", tester))
 
     def assign_comment(self, path: Path, qa_comment: str):
         self._assert_data_file_available()
-        tree, root = self._load_or_create_tree()
-        self._relationship_element(root, path).set("Comment", qa_comment.strip())
-        self._write_tree(tree)
+        self._write_assignment_trees(
+            self._assignment_trees(path, "Comment", qa_comment.strip())
+        )
 
 
 def copy_path_icon() -> QIcon:
@@ -884,10 +1012,16 @@ class ScopeLoadJob(QRunnable):
             groups = scan_test_scope(self.path)
             if not groups or not any(group.test_ids for group in groups):
                 raise ValueError("The selected XML does not contain any valid selected tests.")
-            qa_path = self.path.parent / RELATIONSHIPS_DATA_FILE_NAME
+            qa_path = self.path.parent / REPORT_DATA_FILE_NAME
             qa_store = QAMemberStore()
             qa_store.set_data_file(qa_path)
-            payload = (groups, list(qa_store.members), dict(qa_store.assignments), qa_store.warning)
+            payload = (
+                groups,
+                list(qa_store.members),
+                dict(qa_store.assignments),
+                qa_store.warning,
+                list(qa_store.scope_entries),
+            )
             error = ""
         except Exception as exc:
             payload, error = None, str(exc)
@@ -1632,6 +1766,18 @@ class DetailPage(QWidget):
     def _display_comment(value: str) -> str:
         return value.strip() or "-"
 
+    def refresh_qa_data(self):
+        """Refresh an already-open detail tab after Relationships.xml changes."""
+        assignment = self.qa_store.assignment_for(self.record.path)
+        member = self.qa_store.resolved_member(self.record.path)
+        self.record.qa_member_id = member.member_id if member else assignment.member_id
+        self.record.qa_member_name = member.name if member else assignment.member_id
+        self.record.qa_comment = assignment.qa_comment
+        if not self.editing_member:
+            self.qa_value.setText(self.record.qa_member_name or "Not assigned")
+        if not self.editing_comment:
+            self.comments_value.setText(self._display_comment(self.record.qa_comment))
+
     def _reload_member_combo(self, selected_id: str = ""):
         self.qa_combo.clear()
         self.qa_combo.addItem("Not assigned", "")
@@ -1800,7 +1946,7 @@ class DetailPage(QWidget):
         message.setIcon(QMessageBox.Icon.Warning)
         file_in_use = "is in use by another application" in error
         message.setWindowTitle(
-            f"{RELATIONSHIPS_DATA_FILE_NAME} is in use"
+            "Shared QA XML is in use"
             if file_in_use
             else "Unable to update QA data"
         )
@@ -2537,7 +2683,7 @@ class Dashboard(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Tridonic One4All Viewer — Version 1.9")
+        self.setWindowTitle("Tridonic One4All Viewer — Version 1.11")
         self.resize(1440, 900); self.setMinimumSize(1200, 760)
         self.qa_store = QAMemberStore()
         self.model = ResultsModel(self.qa_store); self.proxy = ResultsProxy(); self.proxy.setSourceModel(self.model)
@@ -2558,7 +2704,9 @@ class MainWindow(QMainWindow):
         self.dashboard.open_record.connect(self.open_record)
         self.tabs.addTab(self.dashboard, "Overview")
         self.tabs.tabBar().setTabButton(0, QTabBar.ButtonPosition.RightSide, None)
-        self.watcher = QFileSystemWatcher(self); self.watcher.directoryChanged.connect(self._schedule_refresh)
+        self.watcher = QFileSystemWatcher(self)
+        self.watcher.directoryChanged.connect(self._schedule_refresh)
+        self.watcher.fileChanged.connect(self._schedule_refresh)
         self.refresh_timer = QTimer(self); self.refresh_timer.setSingleShot(True); self.refresh_timer.setInterval(650)
         self.refresh_timer.timeout.connect(self.refresh)
         self.pool = QThreadPool.globalInstance()
@@ -2575,9 +2723,10 @@ class MainWindow(QMainWindow):
         self._report_job: ReportJob | None = None
         self._scope_job: ScopeLoadJob | None = None
         self._scope_job_silent = False
+        self._refresh_results_after_scope = False
         self._network_activity_count = 0
         self._scan_cache: dict[str, tuple[int, int, TestRecord]] = {}
-        version_label = QLabel("VERSION 1.9")
+        version_label = QLabel("VERSION 1.11")
         version_label.setObjectName("footerMeta")
         powered_label = QLabel("POWERED BY PT TEAM")
         powered_label.setObjectName("footerBrand")
@@ -2627,19 +2776,8 @@ class MainWindow(QMainWindow):
         self.folder = folder
         self.source_path = folder
         self._scan_cache.clear()
-        old = self.watcher.directories()
-        if old: self.watcher.removePaths(old)
-        old_files = self.watcher.files()
-        if old_files: self.watcher.removePaths(old_files)
-        # Avoid a second recursive walk on the UI thread. The worker still scans
-        # XML files recursively; the watcher covers the root and direct folders.
-        watched = [str(folder)]
-        if not is_network_path(folder):
-            try:
-                watched.extend(str(path) for path in folder.iterdir() if path.is_dir())
-            except OSError:
-                pass
-        self.watcher.addPaths(watched); self.refresh()
+        self._reset_watcher_paths()
+        self.refresh()
 
     def set_file(self, file_path: Path):
         file_path = normalized_path(file_path)
@@ -2649,12 +2787,41 @@ class MainWindow(QMainWindow):
         self.folder = file_path.parent
         self.source_path = file_path
         self._scan_cache.clear()
-        old = self.watcher.directories()
-        if old: self.watcher.removePaths(old)
-        old_files = self.watcher.files()
-        if old_files: self.watcher.removePaths(old_files)
-        self.watcher.addPaths([str(file_path.parent), str(file_path)])
+        self._reset_watcher_paths()
         self.refresh()
+
+    def _reset_watcher_paths(self):
+        """Watch results plus the active scope and both legacy QA data files."""
+        old_directories = self.watcher.directories()
+        if old_directories:
+            self.watcher.removePaths(old_directories)
+        old_files = self.watcher.files()
+        if old_files:
+            self.watcher.removePaths(old_files)
+
+        watched: list[Path] = []
+        if self.source_path:
+            if self.source_path.is_file():
+                watched.extend((self.source_path.parent, self.source_path))
+            else:
+                watched.append(self.source_path)
+                # Avoid enumerating a full network tree on the UI thread.
+                if not is_network_path(self.source_path):
+                    try:
+                        watched.extend(path for path in self.source_path.iterdir() if path.is_dir())
+                    except OSError:
+                        pass
+        if self.scope_file:
+            relationships = self.scope_file.parent / RELATIONSHIPS_DATA_FILE_NAME
+            report_data = self.scope_file.parent / REPORT_DATA_FILE_NAME
+            watched.extend((self.scope_file.parent, self.scope_file))
+            if relationships.is_file():
+                watched.append(relationships)
+            if report_data.is_file():
+                watched.append(report_data)
+        unique_existing = list(dict.fromkeys(str(path) for path in watched if path.exists()))
+        if unique_existing:
+            self.watcher.addPaths(unique_existing)
 
     def choose_folder(self):
         # Use the native folder-only picker. Showing XML files here forces Qt to
@@ -2681,7 +2848,7 @@ class MainWindow(QMainWindow):
             self.set_scope_file(Path(chosen))
 
     def set_scope_file(self, scope_file: Path, silent: bool = False):
-        if self.scanning:
+        if self.scanning or self._scope_job is not None:
             self.statusBar().showMessage(
                 "Wait for all results to finish loading before selecting the test scope.",
                 5000,
@@ -2702,6 +2869,8 @@ class MainWindow(QMainWindow):
         self._network_stop(loaded_path)
         if loaded_path != getattr(self, "_scope_job_path", None):
             return
+        refresh_results = self._refresh_results_after_scope
+        self._refresh_results_after_scope = False
         self._scope_job = None
         self.dashboard.stop_loading()
         if error:
@@ -2717,15 +2886,28 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(
                     self, "Invalid test scope", f"The scope XML could not be read:\n{error}"
                 )
+            if refresh_results or self.pending_refresh:
+                self.pending_refresh = False
+                self._start_results_refresh()
             return
-        groups, members, assignments, warning = payload
+        groups, members, assignments, warning, scope_entries = payload
         self.scope_file = loaded_path
         self.scope_groups = groups
         self.qa_store.set_loaded_data(
-            loaded_path.parent / RELATIONSHIPS_DATA_FILE_NAME, members, assignments, warning
+            loaded_path.parent / REPORT_DATA_FILE_NAME,
+            members,
+            assignments,
+            warning,
+            scope_entries,
+            loaded_path.parent / RELATIONSHIPS_DATA_FILE_NAME,
         )
+        self._reset_watcher_paths()
         if self.model.records:
             self.model.set_records(list(self.model.records))
+        for index in range(1, self.tabs.count()):
+            page = self.tabs.widget(index)
+            if isinstance(page, DetailPage):
+                page.refresh_qa_data()
         if self.source_path:
             self.dashboard.update_data(
                 self.source_path, self.model.records, self.scope_file, self.scope_groups
@@ -2739,12 +2921,17 @@ class MainWindow(QMainWindow):
                 f"{len(self.scope_groups)} fixed groups"
             )
 
+        if refresh_results or self.pending_refresh:
+            self.pending_refresh = False
+            self._start_results_refresh()
+
     def clear_scope(self):
         self._scope_job_path = None
         self.dashboard.stop_loading()
         self.scope_file = None
         self.scope_groups = []
         self.qa_store.set_data_file(None)
+        self._reset_watcher_paths()
         if self.model.records:
             self.model.set_records(list(self.model.records))
         if self.source_path:
@@ -2837,8 +3024,18 @@ class MainWindow(QMainWindow):
     def refresh(self):
         if not self.source_path:
             return
-        if self.scanning:
+        if self.scanning or self._scope_job is not None:
             self.pending_refresh = True
+            return
+        if self.scope_file:
+            self.dashboard.set_results_loading(True)
+            self._refresh_results_after_scope = True
+            self.set_scope_file(self.scope_file, silent=True)
+            return
+        self._start_results_refresh()
+
+    def _start_results_refresh(self):
+        if not self.source_path or self.scanning:
             return
         self.scanning = True
         self.dashboard.set_results_loading(True)
@@ -3091,7 +3288,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Tridonic One4All Viewer")
     app.setApplicationDisplayName("Tridonic One4All Viewer")
-    app.setApplicationVersion("1.9")
+    app.setApplicationVersion("1.11")
     icon_path = APP_DIR / "app_icon.ico"
     if icon_path.is_file():
         app.setWindowIcon(QIcon(str(icon_path)))
